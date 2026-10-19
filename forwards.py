@@ -7,28 +7,59 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-DATA = Path(__file__).parent / "data"
+CARPETA = Path(__file__).parent
+NOMBRES_EXCEL = ("Inputs FW.xlsx", "Inputs_FW.xlsx", "inputs FW.xlsx", "INPUTS FW.xlsx")
 
 
 # ---------------------------------------------------------------- datos base
+def ruta_inputs() -> Path:
+    """Excel único con toda la info (Linux distingue mayúsculas, por eso las variantes)."""
+    for nombre in NOMBRES_EXCEL:
+        p = CARPETA / nombre
+        if p.exists():
+            return p
+    raise FileNotFoundError(f"No encuentro el Excel de inputs ({NOMBRES_EXCEL[0]}) junto a app.py")
+
+
+def _hoja(nombre: str) -> pd.DataFrame:
+    df = pd.read_excel(ruta_inputs(), sheet_name=nombre)
+    df.columns = [str(c).strip() for c in df.columns]
+    return df.loc[:, ~df.columns.str.startswith("Unnamed")]
+
+
 def load_lecaps() -> pd.DataFrame:
-    df = pd.read_csv(DATA / "lecaps.csv", parse_dates=["emision", "vencimiento"])
-    df["emision"] = df["emision"].dt.date
-    df["vencimiento"] = df["vencimiento"].dt.date
+    """Hoja 'Lecaps': Ticker | Emisión | Vencimiento | Tasa (TEM)."""
+    df = _hoja("Lecaps").iloc[:, :4]
+    df.columns = ["ticker", "emision", "vencimiento", "tem"]
+    df = df.dropna(subset=["ticker", "vencimiento"])
+    df["ticker"] = df["ticker"].astype(str).str.strip().str.upper()
+    df["emision"] = pd.to_datetime(df["emision"]).dt.date
+    df["vencimiento"] = pd.to_datetime(df["vencimiento"]).dt.date
+    df["tem"] = pd.to_numeric(df["tem"])
     df["vf"] = [valor_final(e, v, t) for e, v, t in zip(df.emision, df.vencimiento, df.tem)]
     return df.sort_values("vencimiento").reset_index(drop=True)
 
 
 def load_feriados() -> set[date]:
-    df = pd.read_csv(DATA / "feriados.csv", parse_dates=["fecha"])
-    return set(df["fecha"].dt.date)
+    """Hoja 'Feriados': una columna de fechas."""
+    s = pd.to_datetime(_hoja("Feriados").iloc[:, 0], errors="coerce").dropna()
+    return set(s.dt.date)
 
 
-def load_precios() -> pd.DataFrame:
-    """Precios históricos, normalizados a base 100 de VN."""
-    df = pd.read_csv(DATA / "precios.csv", parse_dates=["fecha"])
+def load_precios(tickers: list[str] | None = None) -> pd.DataFrame:
+    """Hoja 'Precios': Fecha | un ticker por columna. Normalizado a base 100 de VN."""
+    df = _hoja("Precios")
+    df = df.rename(columns={df.columns[0]: "fecha"})
+    df.columns = ["fecha"] + [c.upper() for c in df.columns[1:]]
+    df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+    df = df.dropna(subset=["fecha"])
     df["fecha"] = df["fecha"].dt.date
-    return normalizar_precios(df.set_index("fecha"))
+    df = df.set_index("fecha")
+    if tickers is not None:
+        df = df.reindex(columns=tickers)
+    df = df.apply(pd.to_numeric, errors="coerce")  # celdas con #N/A, #REF → vacío
+    df = df.dropna(how="all")
+    return normalizar_precios(df[~df.index.duplicated(keep="last")].sort_index())
 
 
 def normalizar_precios(df: pd.DataFrame) -> pd.DataFrame:

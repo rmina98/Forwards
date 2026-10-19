@@ -17,8 +17,10 @@ TZ = ZoneInfo("America/Argentina/Buenos_Aires")
 
 # ---------------------------------------------------------------- datos
 @st.cache_data
-def base():
-    return fw.load_lecaps(), fw.load_feriados(), fw.load_precios()
+def base(_mtime: float):
+    # _mtime: si el Excel cambia, se recarga solo.
+    lecaps = fw.load_lecaps()
+    return lecaps, fw.load_feriados(), fw.load_precios(lecaps.ticker.tolist())
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -37,7 +39,11 @@ def vivo(tickers: tuple[str, ...]):
         return None, None, str(e)
 
 
-lecaps, feriados, hist = base()
+try:
+    lecaps, feriados, hist = base(fw.ruta_inputs().stat().st_mtime)
+except FileNotFoundError as e:
+    st.error(str(e))
+    st.stop()
 hoy = datetime.now(TZ).date()
 
 # ---------------------------------------------------------------- sidebar
