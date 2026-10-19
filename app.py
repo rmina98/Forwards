@@ -73,13 +73,51 @@ if live is not None:
 else:
     precios_hoy, fecha_px, fuente = hist.iloc[-1], hist.index[-1], "último cierre (Excel)"
 
+st.title("Forwards implícitas · Lecaps")
+
+# Precios en vivo editables a mano (se resetean al traer precios nuevos de 1816)
+editados = []
+if live is not None:
+    st.session_state.setdefault("reset_editor", 0)
+    with st.expander("✏️ Precios de hoy (editables)", expanded=False):
+        base_px = pd.DataFrame({
+            "Vencimiento": lecaps.set_index("ticker").vencimiento,
+            "1816": live.reindex(lecaps.ticker).values,
+            "Precio": live.reindex(lecaps.ticker).values,
+        }, index=lecaps.ticker)
+        base_px.index.name = "Ticker"
+        ed = st.data_editor(
+            base_px,
+            key=f"editor_{ts_api:%H%M%S}_{st.session_state.reset_editor}",
+            disabled=["Vencimiento", "1816"],
+            column_config={
+                "Vencimiento": st.column_config.DateColumn(format="DD-MM-YYYY"),
+                "1816": st.column_config.NumberColumn("Precio 1816", format="%.3f"),
+                "Precio": st.column_config.NumberColumn("Precio usado ✏️", format="%.3f",
+                                                        min_value=0.0, step=0.001),
+            },
+            use_container_width=True,
+        )
+        st.caption("Precio cada 100 VN. Lo que cambies acá se usa en la tabla y en el punto de hoy "
+                   "del gráfico. Si una Lecap no tiene precio de 1816, podés cargarlo a mano.")
+        if st.button("↩️ Volver a precios de 1816"):
+            st.session_state.reset_editor += 1
+            st.rerun()
+    precios_hoy = fw.normalizar_precios(ed[["Precio"]])["Precio"]
+    def _distinto(a, b):
+        if pd.isna(a) and pd.isna(b):
+            return False
+        return pd.isna(a) or pd.isna(b) or abs(a - b) > 1e-9
+
+    editados = [t for t in ed.index if _distinto(ed.at[t, "Precio"], ed.at[t, "1816"])]
+    if editados:
+        fuente = f"1816 en vivo + manual ({', '.join(editados)})"
+
 # El histórico + el punto de hoy para el gráfico
 hist_full = hist.copy()
 if live is not None:
-    hist_full.loc[hoy] = live.reindex(hist.columns)
+    hist_full.loc[hoy] = precios_hoy.reindex(hist.columns)
     hist_full = hist_full.sort_index()
-
-st.title("Forwards implícitas · Lecaps")
 
 tab1, tab2 = st.tabs(["Tabla de forwards", "Forward histórica"])
 
@@ -95,9 +133,10 @@ with tab1:
     c2.markdown(f"**Precios:** {fuente if fecha_sel == fecha_px else 'cierre histórico'} · "
                 f"**Liquidación:** {liq:%d-%m-%Y}")
     if fecha_sel == fecha_px and live is not None:
-        faltan = [t for t in lecaps.ticker if pd.isna(live.get(t))]
+        faltan = [t for t in lecaps.ticker if pd.isna(precios_hoy.get(t))]
         if faltan:
-            st.caption(f"⚠️ 1816 no devolvió precio para: {', '.join(faltan)}")
+            st.caption(f"⚠️ Sin precio para: {', '.join(faltan)} (podés cargarlo en "
+                       "'Precios de hoy')")
 
     m = fw.tabla_forward(px, lecaps, liq, tipo)
     m.index.name = f"{fecha_sel:%d-%b}"
