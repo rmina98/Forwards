@@ -4,3 +4,4 @@ numpy>=1.26
 plotly>=5.22
 matplotlib>=3.8
 requests>=2.31
+openpyxl>=3.1
