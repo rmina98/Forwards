@@ -1,6 +1,6 @@
-# Forwards implícitas · Lecaps
+# Forwards implícitas · Lecaps y CER
 
-App de Streamlit que calcula la curva de Lecaps y las tasas forward implícitas entre cada par.
+App de Streamlit con dos solapas: **Lecaps** (tasa fija, nominal) y **CER** (LECER/Boncer, tasa real). Calcula la curva y las forwards implícitas entre cada par.
 
 - **Tabla de forwards**: diagonal = TIR de cada Lecap; celda (i, j) = forward entre el vencimiento de i y el de j. Con precios en vivo de 1816 o cualquier cierre histórico.
 - **Forward histórica**: elegís dos Lecaps y ves la evolución de la forward (y de sus TIR).
@@ -12,7 +12,11 @@ Todo sale del Excel que está junto a `app.py`:
 |---|---|
 | `Lecaps` | Ticker, Emisión, Vencimiento, Tasa (TEM). Pago final = 100·(1+TEM)^(días 30/360 / 30) |
 | `Precios` | Fecha + una columna por ticker (acepta precio cada 1 o cada 100 VN) |
+| `LECER` | Ticker, Emisión, Vencimiento, Tasa, CER inicial. Pago = 100·(1+Tasa)·CER ref / CER inicial |
+| `CER` | Fecha, CER (se descarta la cola constante de proyección) |
 | `Feriados` | fechas, para calcular la liquidación |
+
+CER de referencia: el de 10 días hábiles antes de la liquidación (misma convención que app_BE).
 
 Para sumar una Lecap nueva: fila en `Lecaps` y columna en `Precios`. Al subir el Excel actualizado a GitHub, la app lo recarga sola.
 

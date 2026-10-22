@@ -243,3 +243,149 @@ def forward_historica(hist: pd.DataFrame, lecaps: pd.DataFrame, corto: str, larg
         "Forward": convertir(fb / fa, db - da, tipo),
     }, index=pd.to_datetime(df.index))
     return out[ok]
+
+
+# ================================================================ HARD DOLLAR
+LEY_NY = ("GD",)  # Globales; el resto (AL, AE, AN, AO) se toma como ley argentina
+
+
+def load_flujos_hd() -> pd.DataFrame:
+    """Hoja 'Flujo HD': Ticker | Fecha efectiva de pago | Amortizacion | Valor residual |
+    Tasa de interés | Interés (vn). Montos como fracción del VN original.
+
+    Devuelve flujos cada 100 VN original: interes, amort y total.
+    """
+    raw = _hoja("Flujo HD").iloc[:, :6]
+    raw.columns = ["ticker", "fecha", "amort", "residual", "tasa", "interes"]
+    df = raw.dropna(subset=["ticker", "fecha"]).copy()
+    df["ticker"] = df["ticker"].astype(str).str.strip().str.upper()
+    df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce").dt.date
+    for c in ["amort", "residual", "tasa", "interes"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)  # hay ceros cargados como texto
+    df["amort"] *= 100
+    df["interes"] *= 100
+    df["residual"] *= 100
+    df["flujo"] = df["amort"] + df["interes"]
+    return df.dropna(subset=["fecha"]).sort_values(["ticker", "fecha"]).reset_index(drop=True)
+
+
+def bonos_hd(flujos: pd.DataFrame) -> pd.DataFrame:
+    g = flujos.groupby("ticker")
+    df = pd.DataFrame({
+        "vencimiento": g["fecha"].max(),
+        "amort_total": g["amort"].sum(),
+    }).reset_index()
+    df["ley"] = np.where(df.ticker.str.startswith(LEY_NY), "NY", "ARG")
+    return df.sort_values("vencimiento").reset_index(drop=True)
+
+
+def _tir(precio: float, t: np.ndarray, cf: np.ndarray) -> float:
+    """TIR efectiva anual (act/365) con precio sucio. Newton con resguardo."""
+    if not (precio > 0) or len(cf) == 0:
+        return float("nan")
+    y = 0.08
+    for _ in range(100):
+        v = (1 + y) ** -t
+        f = (cf * v).sum() - precio
+        d = -(t * cf * v / (1 + y)).sum()
+        if d == 0:
+            break
+        paso = f / d
+        y_nuevo = y - paso
+        if y_nuevo <= -0.99:
+            y_nuevo = (y - 0.99) / 2
+        if abs(y_nuevo - y) < 1e-11:
+            return y_nuevo
+        y = y_nuevo
+    return y if abs(f) < 1e-6 else float("nan")
+
+
+def metricas_hd(precios: pd.Series, flujos: pd.DataFrame, liquidacion: date,
+                sufijo: str) -> pd.DataFrame:
+    """TIR y duration (Macaulay y modificada) de cada bono con su precio `ticker+sufijo`."""
+    filas = []
+    for tk, f in flujos.groupby("ticker"):
+        fut = f[f.fecha > liquidacion]
+        if fut.empty:
+            continue
+        p = precios.get(tk + sufijo, np.nan)
+        t = np.array([(d - liquidacion).days / 365 for d in fut.fecha])
+        cf = fut.flujo.to_numpy()
+        y = _tir(p, t, cf)
+        if np.isnan(y):
+            dur = np.nan
+        else:
+            v = cf * (1 + y) ** -t
+            dur = (t * v).sum() / v.sum()
+        residual = f[f.fecha <= liquidacion].residual.iloc[-1] if (f.fecha <= liquidacion).any() else 100.0
+        filas.append({"ticker": tk, "vencimiento": fut.fecha.iloc[-1], "precio": p,
+                      "residual": residual, "TIR": y, "duration": dur,
+                      "dur_mod": dur / (1 + y) if not np.isnan(y) else np.nan})
+    return pd.DataFrame(filas)
+
+
+def tasa_hd(y, tipo: str):
+    """Convierte TIR efectiva anual a TEM / TNA / TEA (mismo criterio que el resto)."""
+    y = np.asarray(y, dtype=float)
+    if tipo == "TEA":
+        return y
+    tem = (1 + y) ** (1 / 12) - 1
+    return tem if tipo == "TEM" else tem * 12
+
+
+def forward_hd(y_a, d_a, y_b, d_b, min_dif: float = 0.25):
+    """Forward efectiva anual entre dos bonos por TIR y duration de Macaulay (años)."""
+    y_a, d_a, y_b, d_b = (np.asarray(x, dtype=float) for x in (y_a, d_a, y_b, d_b))
+    dd = d_b - d_a
+    with np.errstate(invalid="ignore", divide="ignore"):
+        f = ((1 + y_b) ** d_b / (1 + y_a) ** d_a) ** (1 / dd) - 1
+    return np.where(dd > min_dif, f, np.nan)
+
+
+def tabla_forward_hd(met: pd.DataFrame, tipo: str = "TEA") -> pd.DataFrame:
+    """Matriz ordenada por duration: diagonal = TIR; (i, j) = forward entre durations."""
+    m0 = met.dropna(subset=["TIR", "duration"]).sort_values("duration")
+    t = m0.ticker.tolist()
+    y, d = m0.TIR.to_numpy(), m0.duration.to_numpy()
+    m = pd.DataFrame(np.nan, index=t, columns=t)
+    for i in range(len(t)):
+        m.iat[i, i] = float(tasa_hd(y[i], tipo))
+        for j in range(i + 1, len(t)):
+            m.iat[i, j] = float(tasa_hd(forward_hd(y[i], d[i], y[j], d[j]), tipo))
+    return m
+
+
+def forward_historica_hd(hist: pd.DataFrame, flujos: pd.DataFrame, a: str, b: str, sufijo: str,
+                         feriados: set[date], plazo_liq: int = 1, tipo: str = "TEA") -> pd.DataFrame:
+    cols = [a + sufijo, b + sufijo]
+    df = hist.reindex(columns=cols).dropna()
+    filas = []
+    for f, row in df.iterrows():
+        liq = sumar_habiles(f, plazo_liq, feriados)
+        m = metricas_hd(row, flujos[flujos.ticker.isin([a, b])], liq, sufijo).set_index("ticker")
+        if a not in m.index or b not in m.index:
+            continue
+        ra, rb = m.loc[a], m.loc[b]
+        if ra.duration > rb.duration:
+            ra, rb = rb, ra
+        filas.append({"fecha": pd.Timestamp(f),
+                      f"TIR {ra.name}": ra.TIR, f"TIR {rb.name}": rb.TIR,
+                      "Forward": float(forward_hd(ra.TIR, ra.duration, rb.TIR, rb.duration)),
+                      "_dur": (ra.name, rb.name)})
+    if not filas:
+        return pd.DataFrame()
+    out = pd.DataFrame(filas).set_index("fecha")
+    # el orden corto/largo es por duration; se fija el del último día
+    corto, largo = out["_dur"].iloc[-1]
+    out = out.drop(columns="_dur")
+    out = out[[f"TIR {corto}", f"TIR {largo}", "Forward"]] if f"TIR {corto}" in out else out
+    return out.apply(lambda s: tasa_hd(s, tipo))
+
+
+def canje(precios: pd.Series | pd.DataFrame, tickers: list[str]):
+    """Canje MEP/cable en %: (precio D / precio C − 1) × 100."""
+    if isinstance(precios, pd.Series):
+        return pd.Series({t: (precios.get(t + "D", np.nan) / precios.get(t + "C", np.nan) - 1) * 100
+                          for t in tickers})
+    return pd.DataFrame({t: (precios.get(t + "D") / precios.get(t + "C") - 1) * 100
+                         for t in tickers if t + "D" in precios and t + "C" in precios})

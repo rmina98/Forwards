@@ -21,8 +21,12 @@ def base(_mtime: float):
     # _mtime: si el Excel cambia, se recarga solo.
     lecaps = fw.load_lecaps()
     lecer = fw.load_lecer()
-    tickers = lecaps.ticker.tolist() + lecer.ticker.tolist()
-    return (lecaps, lecer, fw.load_cer(), fw.load_feriados(), fw.load_precios(tickers))
+    flujos = fw.load_flujos_hd()
+    hd = fw.bonos_hd(flujos)
+    tickers = (lecaps.ticker.tolist() + lecer.ticker.tolist()
+               + [t + s for t in hd.ticker for s in ("D", "C")])
+    return (lecaps, lecer, flujos, hd, fw.load_cer(), fw.load_feriados(),
+            fw.load_precios(tickers))
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -42,13 +46,17 @@ def vivo(tickers: tuple[str, ...]):
 
 
 try:
-    lecaps, lecer, cer, feriados, hist = base(fw.ruta_inputs().stat().st_mtime)
+    lecaps, lecer, flujos, hd, cer, feriados, hist = base(fw.ruta_inputs().stat().st_mtime)
 except FileNotFoundError as e:
     st.error(str(e))
     st.stop()
 hoy = datetime.now(TZ).date()
-todos = lecaps.ticker.tolist() + lecer.ticker.tolist()
-tipo_de = {**{t: "Lecap" for t in lecaps.ticker}, **{t: "CER" for t in lecer.ticker}}
+hd_d = [t + "D" for t in hd.ticker]
+hd_c = [t + "C" for t in hd.ticker]
+todos = lecaps.ticker.tolist() + lecer.ticker.tolist() + hd_d + hd_c
+tipo_de = {**{t: "Lecap" for t in lecaps.ticker}, **{t: "CER" for t in lecer.ticker},
+           **{t: "HD MEP" for t in hd_d}, **{t: "HD Cable" for t in hd_c}}
+venc_hd = hd.set_index("ticker").vencimiento
 
 # ---------------------------------------------------------------- sidebar
 with st.sidebar:
@@ -66,7 +74,9 @@ with st.sidebar:
     if live is not None:
         n_lec = live.reindex(lecaps.ticker).notna().sum()
         n_cer = live.reindex(lecer.ticker).notna().sum()
-        st.success(f"1816 conectado: {n_lec} Lecaps y {n_cer} CER, consulta de las {ts_api:%H:%M:%S}")
+        n_hd = live.reindex(hd_d + hd_c).notna().sum()
+        st.success(f"1816 conectado: {n_lec} Lecaps, {n_cer} CER y {n_hd} precios HD (D/C), "
+                   f"consulta de las {ts_api:%H:%M:%S}")
         ahora = datetime.now(TZ)
         if not (fw.es_habil(hoy, feriados) and 11 <= ahora.hour < 17):
             st.warning("Mercado cerrado: los precios pueden ser del último cierre.")
@@ -85,7 +95,8 @@ st.title("Forwards implícitas")
 if live is not None:
     st.session_state.setdefault("reset_editor", 0)
     with st.expander("✏️ Precios de hoy (editables)", expanded=False):
-        venc = pd.concat([lecaps.set_index("ticker").vencimiento, lecer.set_index("ticker").vencimiento])
+        venc = pd.concat([lecaps.set_index("ticker").vencimiento, lecer.set_index("ticker").vencimiento,
+                          venc_hd.rename(lambda t: t + "D"), venc_hd.rename(lambda t: t + "C")])
         base_px = pd.DataFrame({
             "Tipo": [tipo_de[t] for t in todos],
             "Vencimiento": venc.reindex(todos).values,
@@ -104,7 +115,7 @@ if live is not None:
             },
             use_container_width=True,
         )
-        st.caption("Precio cada 100 VN. Lo que cambies acá se usa en las tablas y en el punto de hoy "
+        st.caption("Precio cada 100 VN (en HD, cada 100 VN original, en dólares). Lo que cambies acá se usa en las tablas y en el punto de hoy "
                    "de los gráficos. Si una especie no tiene precio de 1816, podés cargarlo a mano.")
         if st.button("↩️ Volver a precios de 1816"):
             st.session_state.reset_editor += 1
@@ -217,7 +228,163 @@ def vista_historica(clave: str, bonos: pd.DataFrame, es_cer: bool):
                        f"forward_{corto}_{largo}.csv", "text/csv", key=f"dl_{clave}")
 
 
-tab_lec, tab_cer = st.tabs(["Lecaps (tasa fija)", "CER (tasa real)"])
+# ---------------------------------------------------------------- hard dollar
+def filtro_ley(clave: str) -> list[str]:
+    ley = st.radio("Bonos", ["Globales (ley NY)", "Bonares (ley ARG)", "Todos"], horizontal=True,
+                   key=f"ley_{clave}")
+    if ley.startswith("Globales"):
+        return hd[hd.ley == "NY"].ticker.tolist()
+    if ley.startswith("Bonares"):
+        return hd[hd.ley == "ARG"].ticker.tolist()
+    return hd.ticker.tolist()
+
+
+def vista_tabla_hd(clave: str, sufijo: str):
+    sel = filtro_ley(clave)
+    c1, c2 = st.columns([1, 3])
+    opciones = [fecha_px] + [d for d in reversed(hist.index) if d != fecha_px]
+    fecha_sel = c1.selectbox("Fecha", opciones, key=f"fecha_{clave}",
+                             format_func=lambda d: f"{d:%d-%m-%Y}" + (" (hoy)" if d == fecha_px else ""))
+    px = precios_hoy if fecha_sel == fecha_px else hist.loc[fecha_sel]
+    liq = fw.sumar_habiles(fecha_sel, plazo, feriados) if plazo else fecha_sel
+    c2.markdown(f"**Precios:** {fuente if fecha_sel == fecha_px else 'cierre histórico'} "
+                f"(especie {sufijo}) · **Liquidación:** {liq:%d-%m-%Y}")
+
+    met = fw.metricas_hd(px, flujos[flujos.ticker.isin(sel)], liq, sufijo)
+    faltan = met[met.precio.isna()].ticker.tolist()
+    if faltan:
+        st.caption(f"⚠️ Sin precio para: {', '.join(t + sufijo for t in faltan)}")
+
+    m = fw.tabla_forward_hd(met, tipo)
+    m.index.name = f"{fecha_sel:%d-%b}"
+    st.caption("Ordenada por duration. Diagonal: TIR de cada bono. Fila i, columna j: forward implícita "
+               "entre la duration de i y la de j: ((1+TIR j)^Dj / (1+TIR i)^Di)^(1/(Dj−Di)) − 1, "
+               "con duration de Macaulay. Vacío si las durations difieren menos de 3 meses.")
+    st.dataframe(estilo_matriz(m), use_container_width=True, height=36 * (len(m) + 1) + 3)
+
+    with st.expander("Detalle por bono"):
+        r = met.sort_values("duration").assign(TIR=lambda d: tasa_fmt(d.TIR))
+        st.dataframe(r.rename(columns={"TIR": f"TIR ({tipo})", "dur_mod": "dur. mod."})
+                     .style.format({"precio": "{:.3f}", "residual": "{:.2f}", f"TIR ({tipo})": "{:.2%}",
+                                    "duration": "{:.2f}", "dur. mod.": "{:.2f}"}),
+                     use_container_width=True, hide_index=True)
+        st.caption("Precio sucio cada 100 VN original. TIR efectiva anual (act/365) sobre los flujos "
+                   "de la hoja 'Flujo HD'.")
+
+
+def tasa_fmt(y):
+    return fw.tasa_hd(y, tipo)
+
+
+def grafico_serie(s: pd.DataFrame, ytitulo: str, pct: bool = True):
+    fig = go.Figure()
+    colores = ["#1f6feb", "#8b949e", "#d29922"]
+    estilos = [dict(width=2.5), dict(width=1.2, dash="dot"), dict(width=1.2, dash="dash")]
+    for i, c in enumerate(s.columns):
+        fig.add_scatter(x=s.index, y=s[c], name=c, line=dict(color=colores[i % 3], **estilos[i % 3]))
+    fig.update_layout(height=480, hovermode="x unified",
+                      yaxis_tickformat=".2%" if pct else ".2f", yaxis_title=ytitulo,
+                      margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h", y=1.08))
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def kpis(f: pd.Series, pct: bool = True, unidad: str = ""):
+    fmt = (lambda v: f"{v:.2%}") if pct else (lambda v: f"{v:.2f}{unidad}")
+    k = st.columns(4)
+    if len(f) > 1:
+        dif = (f.iloc[-1] - f.iloc[-2]) * (1e4 if pct else 1)
+        delta = f"{dif:+.0f} pb" if pct else f"{dif:+.2f}{unidad}"
+    else:
+        delta = None
+    k[0].metric("Actual", fmt(f.iloc[-1]), delta)
+    k[1].metric("Promedio", fmt(f.mean()))
+    k[2].metric("Mínimo", fmt(f.min()), f"{f.idxmin():%d-%m-%y}", delta_color="off")
+    k[3].metric("Máximo", fmt(f.max()), f"{f.idxmax():%d-%m-%y}", delta_color="off")
+
+
+def vista_historica_hd(clave: str, sufijo: str):
+    sel = filtro_ley(clave + "_h")
+    vivos = [t for t in hd.ticker if t in sel and venc_hd[t] > hoy]
+    c1, c2, c3 = st.columns(3)
+    a = c1.selectbox("Bono 1", vivos, index=0, key=f"a_{clave}")
+    resto = [t for t in vivos if t != a]
+    b = c2.selectbox("Bono 2", resto, index=min(len(resto) - 1, 2), key=f"b_{clave}")
+    ver_tir = c3.checkbox("Mostrar TIR de cada uno", value=True, key=f"tir_{clave}")
+
+    with st.spinner("Calculando TIR día por día..."):
+        s = serie_hd(a, b, sufijo, plazo, tipo, hist_full.index[-1],
+                     tuple(hist_full.iloc[-1].reindex([a + sufijo, b + sufijo]).fillna(-1)))
+    if s.empty or s["Forward"].dropna().empty:
+        st.info("No hay precios en común para ese par, o sus durations son demasiado parecidas.")
+        return
+    s = s.dropna(subset=["Forward"])
+    corto, largo = [c.replace("TIR ", "") for c in s.columns[:2]]
+    kpis(s["Forward"])
+    s_graf = s.rename(columns={"Forward": f"Forward {corto} → {largo}"})
+    grafico_serie(s_graf if ver_tir else s_graf.iloc[:, [2]], tipo)
+    st.download_button("Descargar serie (CSV)", s.to_csv().encode(),
+                       f"forward_{corto}{sufijo}_{largo}{sufijo}.csv", "text/csv", key=f"dl_{clave}")
+
+
+@st.cache_data(show_spinner=False)
+def serie_hd(a, b, sufijo, plazo_, tipo_, ultima_fecha, ultimo_px):
+    # ultima_fecha/ultimo_px solo sirven para invalidar el cache cuando cambian los precios de hoy
+    return fw.forward_historica_hd(hist_full, flujos, a, b, sufijo, feriados, plazo_, tipo_)
+
+
+def vista_canje():
+    st.caption("Canje MEP/cable por bono: (precio D / precio C − 1) × 100. Positivo = el cable "
+               "vale más que el MEP.")
+    t1, t2 = st.tabs(["Hoy", "Histórico"])
+    with t1:
+        c = fw.canje(precios_hoy, hd.ticker.tolist())
+        df = pd.DataFrame({"Ley": hd.set_index("ticker").ley, "Vencimiento": venc_hd,
+                           "Precio D": [precios_hoy.get(t + "D") for t in hd.ticker],
+                           "Precio C": [precios_hoy.get(t + "C") for t in hd.ticker],
+                           "Canje %": c}).sort_values("Vencimiento")
+        st.markdown(f"**Precios:** {fuente}")
+        st.dataframe(df.style.format({"Precio D": "{:.3f}", "Precio C": "{:.3f}", "Canje %": "{:.2f}%"})
+                     .background_gradient(subset=["Canje %"], cmap="RdYlGn_r"),
+                     use_container_width=True)
+    with t2:
+        hc = fw.canje(hist_full, hd.ticker.tolist()).dropna(how="all")
+        elegidos = st.multiselect("Bonos", hc.columns.tolist(),
+                                  default=[t for t in ("GD30", "AL30") if t in hc.columns])
+        if not elegidos:
+            st.info("Elegí al menos un bono.")
+            return
+        if len(elegidos) == 1:
+            kpis(hc[elegidos[0]].dropna(), pct=False, unidad="%")
+        fig = go.Figure()
+        for t in elegidos:
+            fig.add_scatter(x=pd.to_datetime(hc.index), y=hc[t], name=t)
+        fig.update_layout(height=460, hovermode="x unified", yaxis_title="Canje %",
+                          yaxis_ticksuffix="%", margin=dict(l=10, r=10, t=30, b=10),
+                          legend=dict(orientation="h", y=1.08))
+        st.plotly_chart(fig, use_container_width=True)
+        st.download_button("Descargar canje (CSV)", hc[elegidos].to_csv().encode(), "canje.csv",
+                           "text/csv", key="dl_canje")
+
+
+tab_lec, tab_cer, tab_mep, tab_ccl, tab_canje = st.tabs(
+    ["Lecaps (tasa fija)", "CER (tasa real)", "Hard dollar · MEP", "Hard dollar · Cable", "Canje MEP/Cable"])
+
+with tab_mep:
+    t1, t2 = st.tabs(["Tabla de forwards", "Forward histórica"])
+    with t1:
+        vista_tabla_hd("mep", "D")
+    with t2:
+        vista_historica_hd("mep", "D")
+
+with tab_ccl:
+    t1, t2 = st.tabs(["Tabla de forwards", "Forward histórica"])
+    with t1:
+        vista_tabla_hd("ccl", "C")
+    with t2:
+        vista_historica_hd("ccl", "C")
+
+with tab_canje:
+    vista_canje()
 
 with tab_lec:
     t1, t2 = st.tabs(["Tabla de forwards", "Forward histórica"])
