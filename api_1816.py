@@ -6,6 +6,9 @@ Nunca la subas al repo.
 
 Los tickers se piden en grupos. Si un grupo falla (p. ej. la API no reconoce algún
 ticker o límite de pedidos), se reintenta con pausas y partiendo el grupo.
+
+Bonos en dólares: 1816 usa el ticker base (AL30) con moneda=mep o moneda=ccl.
+La app los nombra AL30D (MEP) y AL30C (cable), como en la hoja Precios.
 """
 from __future__ import annotations
 
@@ -40,8 +43,11 @@ def _token(api_key: str) -> str:
     return auth.json()["token"]
 
 
-def _pedir(token: str, tickers: list[str]) -> dict[str, float]:
+def _pedir(token: str, tickers: list[str], moneda: str | None = None) -> dict[str, float]:
+    """Pide precioDirty. Para bonos en dólares se pasa el ticker base (AL30) y moneda mep/ccl."""
     params = {"tickers": [t.strip().lower() for t in tickers], "campos": ["precioDirty"]}
+    if moneda:
+        params["moneda"] = moneda
     r = requests.get(URL_INDICADORES, headers={"Authorization": f"Bearer {token}"},
                      params=params, timeout=15)
     if r.status_code >= 400:
@@ -55,11 +61,12 @@ def _pedir(token: str, tickers: list[str]) -> dict[str, float]:
     return precios
 
 
-def _pedir_con_reintentos(token: str, tickers: list[str], intentos: int = 3) -> dict[str, float]:
+def _pedir_con_reintentos(token: str, tickers: list[str], moneda: str | None = None,
+                          intentos: int = 3) -> dict[str, float]:
     espera = 0.6
     for k in range(intentos):
         try:
-            return _pedir(token, tickers)
+            return _pedir(token, tickers, moneda)
         except requests.HTTPError:
             if k == intentos - 1:
                 raise
@@ -69,18 +76,22 @@ def _pedir_con_reintentos(token: str, tickers: list[str], intentos: int = 3) -> 
 
 
 def _pedir_partiendo(token: str, tickers: list[str], precios: dict, rechazados: list,
-                     errores: list) -> None:
-    """Pide el grupo; si falla, lo parte en dos (menos pedidos que ir de a uno)."""
+                     errores: list, moneda: str | None = None, sufijo: str = "") -> None:
+    """Pide el grupo; si falla, lo parte en dos (menos pedidos que ir de a uno).
+
+    Con moneda (mep/ccl) los tickers son base (AL30) y se guardan con sufijo (AL30D / AL30C).
+    """
     try:
-        precios.update(_pedir_con_reintentos(token, tickers))
+        res = _pedir_con_reintentos(token, tickers, moneda)
+        precios.update({k + sufijo: v for k, v in res.items()})
     except requests.HTTPError as e:
         if len(tickers) == 1:
-            rechazados.append(tickers[0].upper())
+            rechazados.append(tickers[0].upper() + sufijo)
             errores.append(str(e))
             return
         mitad = len(tickers) // 2
-        _pedir_partiendo(token, tickers[:mitad], precios, rechazados, errores)
-        _pedir_partiendo(token, tickers[mitad:], precios, rechazados, errores)
+        _pedir_partiendo(token, tickers[:mitad], precios, rechazados, errores, moneda, sufijo)
+        _pedir_partiendo(token, tickers[mitad:], precios, rechazados, errores, moneda, sufijo)
 
 
 def get_live_prices(tickers: list[str]) -> dict[str, float]:
@@ -97,9 +108,21 @@ def get_live_prices(tickers: list[str]) -> dict[str, float]:
     precios: dict[str, float] = {}
     rechazados: list[str] = []
     errores: list[str] = []
-    for i in range(0, len(tickers), TAMANO_GRUPO):
-        _pedir_partiendo(token, tickers[i:i + TAMANO_GRUPO], precios, rechazados, errores)
-        time.sleep(0.3)
+    # Bonos en dólares: AL30D → AL30 con moneda=mep; AL30C → AL30 con moneda=ccl
+    def es_hd(t: str, letra: str) -> bool:
+        t = t.strip().upper()
+        return len(t) > 2 and t[-1] == letra and t[-2].isdigit()
+
+    lotes = [
+        ([t for t in tickers if not (es_hd(t, "D") or es_hd(t, "C"))], None, ""),
+        ([t.strip()[:-1] for t in tickers if es_hd(t, "D")], "mep", "D"),
+        ([t.strip()[:-1] for t in tickers if es_hd(t, "C")], "ccl", "C"),
+    ]
+    for lista, moneda, sufijo in lotes:
+        for i in range(0, len(lista), TAMANO_GRUPO):
+            _pedir_partiendo(token, lista[i:i + TAMANO_GRUPO], precios, rechazados, errores,
+                             moneda, sufijo)
+            time.sleep(0.3)
 
     get_live_prices.rechazados = rechazados
     get_live_prices.errores = list(dict.fromkeys(errores))[:3]  # mensajes distintos
