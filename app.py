@@ -34,15 +34,15 @@ def _vivo(tickers: tuple[str, ...]):
     # Si falla lanza excepción, así el error no queda cacheado.
     p = get_live_prices(list(tickers))
     s = fw.normalizar_precios(pd.DataFrame([p])).iloc[0]
-    return s, datetime.now(TZ)
+    return s, datetime.now(TZ), list(get_live_prices.rechazados)
 
 
 def vivo(tickers: tuple[str, ...]):
     try:
-        s, ts = _vivo(tickers)
-        return s, ts, None
+        s, ts, rech = _vivo(tickers)
+        return s, ts, None, rech
     except Exception as e:  # sin API → se usa el último cierre
-        return None, None, str(e)
+        return None, None, str(e), []
 
 
 try:
@@ -68,7 +68,7 @@ with st.sidebar:
     if usar_api and st.button("🔄 Actualizar precios"):
         _vivo.clear()
 
-live, ts_api, err = (vivo(tuple(todos)) if usar_api else (None, None, None))
+live, ts_api, err, rechazados = (vivo(tuple(todos)) if usar_api else (None, None, None, []))
 
 with st.sidebar:
     if live is not None:
@@ -80,6 +80,9 @@ with st.sidebar:
         ahora = datetime.now(TZ)
         if not (fw.es_habil(hoy, feriados) and 11 <= ahora.hour < 17):
             st.warning("Mercado cerrado: los precios pueden ser del último cierre.")
+        if rechazados:
+            st.warning(f"1816 rechazó estos tickers: {', '.join(rechazados)}. Para esos se usa el "
+                       "precio que cargues a mano en 'Precios de hoy'.")
     elif usar_api:
         st.error(f"Falló la API: {err}. Usando Excel.")
 
