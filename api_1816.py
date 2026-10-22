@@ -5,11 +5,12 @@ Streamlit Cloud: Settings → Secrets) o de la variable de entorno API_1816_KEY.
 Nunca la subas al repo.
 
 Los tickers se piden en grupos. Si un grupo falla (p. ej. la API no reconoce algún
-ticker), se reintenta de a uno y se saltean los que dan error.
+ticker o límite de pedidos), se reintenta con pausas y partiendo el grupo.
 """
 from __future__ import annotations
 
 import os
+import time
 
 import requests
 import streamlit as st
@@ -54,10 +55,39 @@ def _pedir(token: str, tickers: list[str]) -> dict[str, float]:
     return precios
 
 
+def _pedir_con_reintentos(token: str, tickers: list[str], intentos: int = 3) -> dict[str, float]:
+    espera = 0.6
+    for k in range(intentos):
+        try:
+            return _pedir(token, tickers)
+        except requests.HTTPError:
+            if k == intentos - 1:
+                raise
+            time.sleep(espera)
+            espera *= 2
+    return {}
+
+
+def _pedir_partiendo(token: str, tickers: list[str], precios: dict, rechazados: list,
+                     errores: list) -> None:
+    """Pide el grupo; si falla, lo parte en dos (menos pedidos que ir de a uno)."""
+    try:
+        precios.update(_pedir_con_reintentos(token, tickers))
+    except requests.HTTPError as e:
+        if len(tickers) == 1:
+            rechazados.append(tickers[0].upper())
+            errores.append(str(e))
+            return
+        mitad = len(tickers) // 2
+        _pedir_partiendo(token, tickers[:mitad], precios, rechazados, errores)
+        _pedir_partiendo(token, tickers[mitad:], precios, rechazados, errores)
+
+
 def get_live_prices(tickers: list[str]) -> dict[str, float]:
     """Devuelve {TICKER: precioDirty}. Lanza excepción solo si no trae ningún precio.
 
-    Los tickers que la API rechazó quedan en get_live_prices.rechazados (lista).
+    Los tickers que la API rechazó quedan en get_live_prices.rechazados y el
+    mensaje de error de 1816 en get_live_prices.errores.
     """
     api_key = get_api_key()
     if not api_key:
@@ -66,24 +96,17 @@ def get_live_prices(tickers: list[str]) -> dict[str, float]:
 
     precios: dict[str, float] = {}
     rechazados: list[str] = []
-    ultimo_error = None
+    errores: list[str] = []
     for i in range(0, len(tickers), TAMANO_GRUPO):
-        grupo = tickers[i:i + TAMANO_GRUPO]
-        try:
-            precios.update(_pedir(token, grupo))
-        except requests.HTTPError as e:
-            ultimo_error = e
-            for t in grupo:  # de a uno, para aislar el ticker problemático
-                try:
-                    precios.update(_pedir(token, [t]))
-                except requests.HTTPError as e1:
-                    ultimo_error = e1
-                    rechazados.append(t.upper())
+        _pedir_partiendo(token, tickers[i:i + TAMANO_GRUPO], precios, rechazados, errores)
+        time.sleep(0.3)
 
     get_live_prices.rechazados = rechazados
+    get_live_prices.errores = list(dict.fromkeys(errores))[:3]  # mensajes distintos
     if not precios:
-        raise ValueError(f"La API no devolvió precios. Último error: {ultimo_error}")
+        raise ValueError(f"La API no devolvió precios. Error: {errores[:1]}")
     return precios
 
 
 get_live_prices.rechazados = []
+get_live_prices.errores = []
