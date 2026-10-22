@@ -6,14 +6,15 @@ App de Streamlit que calcula la curva de Lecaps y las tasas forward implícitas 
 - **Forward histórica**: elegís dos Lecaps y ves la evolución de la forward (y de sus TIR).
 - Tasas en TEM / TNA (TEM×12) / TEA, liquidación T+1 o T+0.
 
-## Datos (`data/`)
-| archivo | contenido |
+## Datos: `Inputs FW.xlsx`
+Todo sale del Excel que está junto a `app.py`:
+| hoja | contenido |
 |---|---|
-| `lecaps.csv` | ticker, emisión, vencimiento, TEM de emisión. Pago final = 100·(1+TEM)^(días 30/360 / 30) |
-| `precios.csv` | cierres diarios (una columna por ticker; acepta precio cada 1 o cada 100 VN) |
-| `feriados.csv` | feriados para calcular la fecha de liquidación |
+| `Lecaps` | Ticker, Emisión, Vencimiento, Tasa (TEM). Pago final = 100·(1+TEM)^(días 30/360 / 30) |
+| `Precios` | Fecha + una columna por ticker (acepta precio cada 1 o cada 100 VN) |
+| `Feriados` | fechas, para calcular la liquidación |
 
-Para sumar una Lecap nueva: agregá la fila en `lecaps.csv` y la columna en `precios.csv`.
+Para sumar una Lecap nueva: fila en `Lecaps` y columna en `Precios`. Al subir el Excel actualizado a GitHub, la app lo recarga sola.
 
 ## Correr local
 ```
