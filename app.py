@@ -325,8 +325,11 @@ def vista_historica_hd(clave: str, sufijo: str):
     s = s.dropna(subset=["Forward"])
     corto, largo = [c.replace("TIR ", "") for c in s.columns[:2]]
     kpis(s["Forward"])
-    s_graf = s.rename(columns={"Forward": f"Forward {corto} → {largo}"})
-    grafico_serie(s_graf if ver_tir else s_graf.iloc[:, [2]], tipo)
+    nombre_fwd = f"Forward {corto} → {largo}"
+    s_graf = s.rename(columns={"Forward": nombre_fwd})
+    # Primero la forward (línea azul llena); después las TIR (punteadas)
+    s_graf = s_graf[[nombre_fwd, f"TIR {corto}", f"TIR {largo}"]]
+    grafico_serie(s_graf if ver_tir else s_graf[[nombre_fwd]], tipo)
     st.download_button("Descargar serie (CSV)", s.to_csv().encode(),
                        f"forward_{corto}{sufijo}_{largo}{sufijo}.csv", "text/csv", key=f"dl_{clave}")
 
