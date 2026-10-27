@@ -125,6 +125,7 @@ def load_precios(tickers: list[str] | None = None) -> pd.DataFrame:
     if tickers is not None:
         df = df.reindex(columns=tickers)
     df = df.apply(pd.to_numeric, errors="coerce")  # celdas con #N/A, #REF → vacío
+    df = df.where(df > 0)  # precios en 0 → vacío
     df = df.dropna(how="all")
     return normalizar_precios(df[~df.index.duplicated(keep="last")].sort_index())
 
@@ -389,3 +390,33 @@ def canje(precios: pd.Series | pd.DataFrame, tickers: list[str]):
                           for t in tickers})
     return pd.DataFrame({t: (precios.get(t + "D") / precios.get(t + "C") - 1) * 100
                          for t in tickers if t + "D" in precios and t + "C" in precios})
+
+
+# ---------------------------------------------------------------- CER ya conocido
+def proximo_habil(d: date, feriados: set[date]) -> date:
+    while not es_habil(d, feriados):
+        d += timedelta(days=1)
+    return d
+
+
+def ref_cer_vto(vencimiento: date, feriados: set[date], rezago: int = 10) -> date:
+    """Fecha del CER que define el pago: 10 hábiles antes del día de cobro (como app_BE)."""
+    return restar_habiles(proximo_habil(vencimiento, feriados), rezago, feriados)
+
+
+def limite_cer_publicado(fecha_op: date, cer: pd.Series) -> date:
+    """Hasta qué fecha se conoce el CER en fecha_op: el IPC se publica ~día 15, así que el CER
+    se conoce hasta el 15 (de este mes o del próximo). Tope: último dato cargado en la hoja."""
+    if fecha_op.day < 15:
+        lim = date(fecha_op.year, fecha_op.month, 15)
+    else:
+        lim = date(fecha_op.year + 1, 1, 15) if fecha_op.month == 12 else \
+            date(fecha_op.year, fecha_op.month + 1, 15)
+    return min(lim, cer.index[-1])
+
+
+def cer_ya_fijo(lecer: pd.DataFrame, fecha_op: date, cer: pd.Series,
+                feriados: set[date]) -> list[str]:
+    """Tickers cuyo CER al vencimiento ya se conoce en fecha_op (pasaron a ser tasa fija)."""
+    lim = limite_cer_publicado(fecha_op, cer)
+    return [t for t, v in zip(lecer.ticker, lecer.vencimiento) if ref_cer_vto(v, feriados) <= lim]

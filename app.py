@@ -169,11 +169,18 @@ def vista_tabla(clave: str, bonos: pd.DataFrame, es_cer: bool):
 
     info = (f"**Precios:** {fuente if fecha_sel == fecha_px else 'cierre histórico'} · "
             f"**Liquidación:** {liq:%d-%m-%Y}")
+    fijos = []
     if es_cer:
+        # Las que ya conocen el CER del vencimiento pasaron a ser tasa fija: afuera
+        fijos = fw.cer_ya_fijo(bonos, fecha_sel, cer, feriados)
+        bonos = bonos[~bonos.ticker.isin(fijos)]
         f_ref, cer_ref = fw.cer_referencia(liq, cer, feriados)
         bonos = fw.lecer_a_fecha(bonos, cer_ref)
         info += f" · **CER ref.** ({f_ref:%d-%m-%Y}, 10 hábiles antes): {cer_ref:,.4f}"
     c2.markdown(info)
+    if fijos:
+        st.caption(f"ℹ️ Fuera de la tabla por tener ya conocido el CER al vencimiento "
+                   f"(ahora son tasa fija): {', '.join(fijos)}")
 
     faltan = [t for t in bonos.ticker if t in px.index and pd.isna(px.get(t))
               and bonos.set_index("ticker").vencimiento[t] > liq]
@@ -196,6 +203,9 @@ def vista_tabla(clave: str, bonos: pd.DataFrame, es_cer: bool):
 
 def vista_historica(clave: str, bonos: pd.DataFrame, es_cer: bool):
     vivas = bonos[bonos.vencimiento > hoy].ticker.tolist()
+    if es_cer:
+        fijos_hoy = fw.cer_ya_fijo(bonos, hoy, cer, feriados)
+        vivas = [t for t in vivas if t not in fijos_hoy]
     c1, c2, c3 = st.columns(3)
     a = c1.selectbox("Bono corto", vivas, index=0, key=f"a_{clave}")
     resto = [t for t in vivas if t != a]
@@ -204,6 +214,10 @@ def vista_historica(clave: str, bonos: pd.DataFrame, es_cer: bool):
 
     s = fw.forward_historica(hist_full, bonos, a, b, feriados, plazo, tipo,
                              coef=coef_cer if es_cer else None)
+    if es_cer and not s.empty:
+        # Se cortan los días en que alguno de los dos ya tenía el CER del vencimiento conocido
+        s = s[[not ({a, b} & set(fw.cer_ya_fijo(bonos[bonos.ticker.isin([a, b])], d.date(), cer,
+                                                 feriados))) for d in s.index]]
     if s.empty:
         st.info("No hay precios en común para ese par.")
         return
