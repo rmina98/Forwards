@@ -78,7 +78,7 @@ with st.sidebar:
         st.success(f"1816 conectado: {n_lec} Lecaps, {n_cer} CER y {n_hd} precios HD (D/C), "
                    f"consulta de las {ts_api:%H:%M:%S}")
         ahora = datetime.now(TZ)
-        if not (fw.es_habil(hoy, feriados) and 11 <= ahora.hour < 17):
+        if not (fw.es_habil(hoy, feriados) and (10, 30) <= (ahora.hour, ahora.minute) < (17, 0)):
             st.warning("Mercado cerrado: los precios pueden ser del último cierre.")
         if rechazados:
             st.warning(f"1816 rechazó estos tickers: {', '.join(rechazados)}. Para esos se usa el "
