@@ -423,12 +423,10 @@ def fecha_anterior(objetivo):
 
 
 def vista_curvas():
-    c1, c2, c3 = st.columns([2, 1, 1])
+    c1, c2 = st.columns([3, 1])
     curva = c1.radio("Curva", ["Tasa fija", "CER", "HD MEP", "HD Cable"], horizontal=True,
                      key="curva_tipo")
     modelo = c2.selectbox("Ajuste", ["Nelson-Siegel", "Logarítmica"], key="curva_modelo")
-    umbral = c3.number_input("Umbral rico/barato (pb)", min_value=0, value=15, step=5,
-                             key="curva_umbral")
     sel_hd = filtro_ley("curva") if curva.startswith("HD") else []
 
     c1, c2, c3 = st.columns([1, 1, 2])
@@ -501,12 +499,10 @@ def vista_curvas():
                       margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h", y=1.08))
     st.plotly_chart(fig, use_container_width=True)
 
-    # ---- tabla rico / barato
-    p["Lectura"] = np.where(p.spread > umbral, "Barato ▲",
-                            np.where(p.spread < -umbral, "Rico ▼", "En curva"))
+    # ---- tabla
     cols = {"ticker": "Ticker", "vencimiento": "Vencimiento", "duration": "Duration",
             "precio": "Precio", "TIR": f"TIR ({unidad})", "curva": "TIR curva",
-            "spread": "Spread (pb)", "Lectura": "Lectura"}
+            "spread": "Spread (pb)"}
     if "var" in p:
         cols["var"] = f"Δ TIR vs {fecha_c:%d-%m} (pb)"
     t = p[list(cols)].rename(columns=cols)
