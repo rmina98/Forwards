@@ -61,6 +61,9 @@ venc_hd = hd.set_index("ticker").vencimiento
 
 # ---------------------------------------------------------------- sidebar
 with st.sidebar:
+    st.title("Renta fija")
+    seccion = st.radio("Sección", ["Forwards", "Curvas", "Canje MEP/Cable"], key="seccion")
+    st.markdown("---")
     st.header("Parámetros")
     tipo = st.radio("Expresar tasas en", ["TEM", "TNA", "TEA"], index=2, horizontal=True)
     plazo = st.radio("Liquidación", [1, 0], format_func=lambda x: f"T+{x}", horizontal=True)
@@ -95,7 +98,8 @@ if live is not None:
 else:
     precios_hoy, fecha_px, fuente = hist.iloc[-1], hist.index[-1], "último cierre (Excel)"
 
-st.title("Forwards implícitas")
+st.title({"Forwards": "Forwards implícitas", "Curvas": "Curvas de rendimiento",
+          "Canje MEP/Cable": "Canje MEP / Cable"}[seccion])
 
 # Precios en vivo editables a mano (se resetean al traer precios nuevos de 1816)
 if live is not None:
@@ -519,40 +523,40 @@ def vista_curvas():
                        key="dl_curva")
 
 
-tab_curvas, tab_lec, tab_cer, tab_mep, tab_ccl, tab_canje = st.tabs(
-    ["Curvas", "Lecaps (tasa fija)", "CER (tasa real)", "Hard dollar · MEP", "Hard dollar · Cable",
-     "Canje MEP/Cable"])
-
-with tab_curvas:
+if seccion == "Curvas":
     vista_curvas()
 
-with tab_mep:
-    t1, t2 = st.tabs(["Tabla de forwards", "Forward histórica"])
-    with t1:
-        vista_tabla_hd("mep", "D")
-    with t2:
-        vista_historica_hd("mep", "D")
-
-with tab_ccl:
-    t1, t2 = st.tabs(["Tabla de forwards", "Forward histórica"])
-    with t1:
-        vista_tabla_hd("ccl", "C")
-    with t2:
-        vista_historica_hd("ccl", "C")
-
-with tab_canje:
+elif seccion == "Canje MEP/Cable":
     vista_canje()
 
-with tab_lec:
-    t1, t2 = st.tabs(["Tabla de forwards", "Forward histórica"])
-    with t1:
-        vista_tabla("lec", lecaps, es_cer=False)
-    with t2:
-        vista_historica("lec", lecaps, es_cer=False)
+else:  # Forwards
+    tab_lec, tab_cer, tab_mep, tab_ccl = st.tabs(
+        ["Lecaps (tasa fija)", "CER (tasa real)", "Hard dollar · MEP", "Hard dollar · Cable"])
 
-with tab_cer:
-    t1, t2 = st.tabs(["Tabla de forwards", "Forward histórica"])
-    with t1:
-        vista_tabla("cer", lecer, es_cer=True)
-    with t2:
-        vista_historica("cer", lecer, es_cer=True)
+    with tab_lec:
+        t1, t2 = st.tabs(["Tabla de forwards", "Forward histórica"])
+        with t1:
+            vista_tabla("lec", lecaps, es_cer=False)
+        with t2:
+            vista_historica("lec", lecaps, es_cer=False)
+
+    with tab_cer:
+        t1, t2 = st.tabs(["Tabla de forwards", "Forward histórica"])
+        with t1:
+            vista_tabla("cer", lecer, es_cer=True)
+        with t2:
+            vista_historica("cer", lecer, es_cer=True)
+
+    with tab_mep:
+        t1, t2 = st.tabs(["Tabla de forwards", "Forward histórica"])
+        with t1:
+            vista_tabla_hd("mep", "D")
+        with t2:
+            vista_historica_hd("mep", "D")
+
+    with tab_ccl:
+        t1, t2 = st.tabs(["Tabla de forwards", "Forward histórica"])
+        with t1:
+            vista_tabla_hd("ccl", "C")
+        with t2:
+            vista_historica_hd("ccl", "C")
