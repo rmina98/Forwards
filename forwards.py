@@ -131,8 +131,13 @@ def load_precios(tickers: list[str] | None = None) -> pd.DataFrame:
 
 
 def normalizar_precios(df: pd.DataFrame) -> pd.DataFrame:
-    # En el Excel conviven precios cada 1 VN (1,26) y cada 100 VN (134,5).
-    return df.apply(lambda s: s.where(s.isna() | (s >= 10), s * 100))
+    """Lleva todo a base 100 VN. En el Excel conviven precios cada 100 VN (134,5),
+    cada 1 VN (1,345) y hasta cada 0,01 VN (0,01345): se multiplica por 100 hasta pasar 10."""
+    def fix(s: pd.Series) -> pd.Series:
+        for _ in range(3):
+            s = s.where(s.isna() | (s >= 10), s * 100)
+        return s
+    return df.apply(fix)
 
 
 # ---------------------------------------------------------------- fechas
@@ -420,3 +425,64 @@ def cer_ya_fijo(lecer: pd.DataFrame, fecha_op: date, cer: pd.Series,
     """Tickers cuyo CER al vencimiento ya se conoce en fecha_op (pasaron a ser tasa fija)."""
     lim = limite_cer_publicado(fecha_op, cer)
     return [t for t, v in zip(lecer.ticker, lecer.vencimiento) if ref_cer_vto(v, feriados) <= lim]
+
+
+# ================================================================ CURVAS AJUSTADAS
+MIN_PUNTOS_NS = 6
+
+def _ns_base(x: np.ndarray, tau: float) -> np.ndarray:
+    z = np.maximum(x, 1e-6) / tau
+    f1 = (1 - np.exp(-z)) / z
+    return np.column_stack([np.ones_like(z), f1, f1 - np.exp(-z)])
+
+
+def ajustar_curva(x, y, modelo: str = "Nelson-Siegel", pesos=None):
+    """Ajusta TIR (y) contra duration en años (x).
+
+    Nelson-Siegel: y = b0 + b1·(1−e^(−x/τ))/(x/τ) + b2·[(1−e^(−x/τ))/(x/τ) − e^(−x/τ)].
+    Para cada τ de una grilla los b son mínimos cuadrados; se queda el τ de menor error.
+    Logarítmica: y = a + b·ln(x). Con menos de MIN_PUNTOS_NS puntos, Nelson-Siegel pasa a
+    logarítmica (con 4 parámetros y pocos bonos la curva pasa por todos y el rico/barato da 0).
+
+    Devuelve (función x → y, descripción del ajuste).
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    ok = np.isfinite(x) & np.isfinite(y) & (x > 0)
+    x, y = x[ok], y[ok]
+    w = np.ones_like(x) if pesos is None else np.asarray(pesos, dtype=float)[ok]
+    if len(x) < 2:
+        return None, "Pocos puntos para ajustar"
+    sw = np.sqrt(w)
+
+    if modelo == "Nelson-Siegel" and len(x) >= MIN_PUNTOS_NS:
+        mejor = None
+        for tau in np.geomspace(0.02, 15, 160):
+            X = _ns_base(x, tau)
+            b, *_ = np.linalg.lstsq(X * sw[:, None], y * sw, rcond=None)
+            sse = float((w * (X @ b - y) ** 2).sum())
+            if mejor is None or sse < mejor[0]:
+                mejor = (sse, tau, b)
+        _, tau, b = mejor
+        return (lambda xx: _ns_base(np.atleast_1d(np.asarray(xx, dtype=float)), tau) @ b,
+                f"Nelson-Siegel (τ = {tau:.2f} años)")
+
+    X = np.column_stack([np.ones_like(x), np.log(x)])
+    b, *_ = np.linalg.lstsq(X * sw[:, None], y * sw, rcond=None)
+    nota = "Logarítmica" + (" (pocos puntos para Nelson-Siegel)" if modelo == "Nelson-Siegel" else "")
+    return (lambda xx: b[0] + b[1] * np.log(np.maximum(np.atleast_1d(np.asarray(xx, dtype=float)),
+                                                        1e-6)), nota)
+
+
+def puntos_cero_cupon(precios: pd.Series, bonos: pd.DataFrame, liquidacion: date) -> pd.DataFrame:
+    """Lecaps / LECER: duration = plazo en años (son cupón cero). TIR efectiva anual."""
+    r = resumen(precios, bonos, liquidacion)
+    return pd.DataFrame({"ticker": r.ticker, "vencimiento": r.vencimiento,
+                         "duration": r.dias / 365, "TIR": r.TEA, "precio": r.precio})
+
+
+def puntos_hd(precios: pd.Series, flujos: pd.DataFrame, liquidacion: date, sufijo: str,
+              tickers: list[str] | None = None) -> pd.DataFrame:
+    f = flujos if tickers is None else flujos[flujos.ticker.isin(tickers)]
+    m = metricas_hd(precios, f, liquidacion, sufijo).dropna(subset=["TIR", "duration"])
+    return m[["ticker", "vencimiento", "duration", "TIR", "precio"]].reset_index(drop=True)

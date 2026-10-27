@@ -1,9 +1,10 @@
 """Calculadora de tasas forward – Lecaps (tasa fija) y CER (LECER / Boncer)."""
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -388,8 +389,142 @@ def vista_canje():
                            "text/csv", key="dl_canje")
 
 
-tab_lec, tab_cer, tab_mep, tab_ccl, tab_canje = st.tabs(
-    ["Lecaps (tasa fija)", "CER (tasa real)", "Hard dollar · MEP", "Hard dollar · Cable", "Canje MEP/Cable"])
+# ---------------------------------------------------------------- curvas ajustadas
+AZUL, GRIS = "#1f6feb", "#8b949e"
+
+
+def precios_de(fecha):
+    return precios_hoy if fecha == fecha_px else hist.loc[fecha]
+
+
+def puntos_curva(curva: str, fecha, sel_hd: list[str]) -> pd.DataFrame:
+    px = precios_de(fecha)
+    liq = fw.sumar_habiles(fecha, plazo, feriados) if plazo else fecha
+    if curva == "Tasa fija":
+        p = fw.puntos_cero_cupon(px, lecaps, liq)
+    elif curva == "CER":
+        fijos = fw.cer_ya_fijo(lecer, fecha, cer, feriados)
+        vivas = lecer[~lecer.ticker.isin(fijos)]
+        p = fw.puntos_cero_cupon(px, fw.lecer_a_fecha(vivas, coef_cer(liq)), liq)
+    else:
+        p = fw.puntos_hd(px, flujos, liq, "D" if curva == "HD MEP" else "C", sel_hd)
+    p = p.dropna(subset=["TIR", "duration"]).copy()
+    p["TIR"] = fw.tasa_hd(p["TIR"], tipo)  # misma unidad que el resto de la app
+    return p.sort_values("duration").reset_index(drop=True)
+
+
+def fecha_anterior(objetivo):
+    previas = [d for d in hist.index if d <= objetivo]
+    return previas[-1] if previas else None
+
+
+def vista_curvas():
+    c1, c2, c3 = st.columns([2, 1, 1])
+    curva = c1.radio("Curva", ["Tasa fija", "CER", "HD MEP", "HD Cable"], horizontal=True,
+                     key="curva_tipo")
+    modelo = c2.selectbox("Ajuste", ["Nelson-Siegel", "Logarítmica"], key="curva_modelo")
+    umbral = c3.number_input("Umbral rico/barato (pb)", min_value=0, value=15, step=5,
+                             key="curva_umbral")
+    sel_hd = filtro_ley("curva") if curva.startswith("HD") else []
+
+    c1, c2, c3 = st.columns([1, 1, 2])
+    opciones = [fecha_px] + [d for d in reversed(hist.index) if d != fecha_px]
+    fecha = c1.selectbox("Fecha", opciones, key="curva_fecha",
+                         format_func=lambda d: f"{d:%d-%m-%Y}" + (" (hoy)" if d == fecha_px else ""))
+    comp = c2.selectbox("Comparar con", ["Sin comparar", "1 semana antes", "1 mes antes",
+                                         "3 meses antes", "Otra fecha"], index=2, key="curva_comp")
+    fecha_c = None
+    if comp == "Otra fecha":
+        fecha_c = c3.selectbox("Fecha de comparación", [d for d in reversed(hist.index) if d < fecha],
+                               key="curva_fecha_c", format_func=lambda d: f"{d:%d-%m-%Y}")
+    elif comp != "Sin comparar":
+        dias = {"1 semana antes": 7, "1 mes antes": 30, "3 meses antes": 91}[comp]
+        fecha_c = fecha_anterior(fecha - timedelta(days=dias))
+
+    p = puntos_curva(curva, fecha, sel_hd)
+    if len(p) < 2:
+        st.info("No hay suficientes bonos con precio para armar la curva en esa fecha.")
+        return
+    excluir = st.multiselect("Excluir del ajuste (se siguen mostrando)", p.ticker.tolist(),
+                             key=f"curva_excl_{curva}")
+    usar = ~p.ticker.isin(excluir)
+    fn, desc = fw.ajustar_curva(p.duration[usar], p.TIR[usar], modelo)
+    if fn is None:
+        st.info(desc)
+        return
+    p["curva"] = fn(p.duration)
+    p["spread"] = (p.TIR - p.curva) * 1e4
+
+    pc, fn_c = None, None
+    if fecha_c is not None:
+        pc = puntos_curva(curva, fecha_c, sel_hd)
+        pc = pc[~pc.ticker.isin(excluir)]
+        if len(pc) >= 2:
+            fn_c, _ = fw.ajustar_curva(pc.duration, pc.TIR, modelo)
+            p = p.merge(pc[["ticker", "TIR"]].rename(columns={"TIR": "TIR_c"}), on="ticker", how="left")
+            p["var"] = (p.TIR - p.TIR_c) * 1e4
+
+    unidad = f"{tipo}{' real' if curva == 'CER' else ''}"
+    st.caption(f"{desc}. Ajuste sobre TIR ({unidad}) contra duration en años. Spread = TIR − curva: "
+               "positivo = el bono rinde más que la curva (**barato**); negativo = **rico**.")
+
+    # ---- gráfico
+    xs = np.linspace(max(p.duration.min() * 0.9, 1e-3), p.duration.max() * 1.03, 200)
+    fig = go.Figure()
+    if fn_c is not None:
+        fig.add_scatter(x=xs, y=fn_c(xs), mode="lines", name=f"Curva {fecha_c:%d-%m-%y}",
+                        line=dict(color=GRIS, width=2, dash="dash"), hoverinfo="skip")
+        fig.add_scatter(x=pc.duration, y=pc.TIR, mode="markers", name=f"Bonos {fecha_c:%d-%m-%y}",
+                        marker=dict(color=GRIS, size=8, symbol="circle-open"),
+                        customdata=pc[["ticker"]],
+                        hovertemplate="%{customdata[0]}<br>Duration %{x:.2f}<br>TIR %{y:.2%}<extra></extra>")
+    fig.add_scatter(x=xs, y=fn(xs), mode="lines", name=f"Curva {fecha:%d-%m-%y}",
+                    line=dict(color=AZUL, width=2), hoverinfo="skip")
+    for incl, nombre, simbolo in [(usar, f"Bonos {fecha:%d-%m-%y}", "circle"),
+                                  (~usar, "Excluidos del ajuste", "x")]:
+        q = p[incl]
+        if q.empty:
+            continue
+        fig.add_scatter(x=q.duration, y=q.TIR, mode="markers+text", name=nombre, text=q.ticker,
+                        textposition="top center", textfont=dict(size=11),
+                        marker=dict(color=AZUL, size=9, symbol=simbolo,
+                                    line=dict(color="white", width=1)),
+                        customdata=np.column_stack([q.ticker, q.spread]),
+                        hovertemplate="%{customdata[0]}<br>Duration %{x:.2f}<br>TIR %{y:.2%}"
+                                      "<br>Spread %{customdata[1]:+.0f} pb<extra></extra>")
+    fig.update_layout(height=520, xaxis_title="Duration (años)", yaxis_title=unidad,
+                      yaxis_tickformat=".1%", hovermode="closest",
+                      margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h", y=1.08))
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ---- tabla rico / barato
+    p["Lectura"] = np.where(p.spread > umbral, "Barato ▲",
+                            np.where(p.spread < -umbral, "Rico ▼", "En curva"))
+    cols = {"ticker": "Ticker", "vencimiento": "Vencimiento", "duration": "Duration",
+            "precio": "Precio", "TIR": f"TIR ({unidad})", "curva": "TIR curva",
+            "spread": "Spread (pb)", "Lectura": "Lectura"}
+    if "var" in p:
+        cols["var"] = f"Δ TIR vs {fecha_c:%d-%m} (pb)"
+    t = p[list(cols)].rename(columns=cols)
+    lim = max(float(p.spread.abs().max()), 1.0)
+    fmt = {"Duration": "{:.2f}", "Precio": "{:.3f}", f"TIR ({unidad})": "{:.2%}",
+           "TIR curva": "{:.2%}", "Spread (pb)": "{:+.0f}"}
+    if "var" in p:
+        fmt[cols["var"]] = "{:+.0f}"
+    st.dataframe(t.style.format(fmt, na_rep="")
+                 .background_gradient(subset=["Spread (pb)"], cmap="RdYlGn", vmin=-lim, vmax=lim),
+                 use_container_width=True, hide_index=True)
+    st.download_button("Descargar tabla (CSV)", t.to_csv(index=False).encode(),
+                       f"curva_{curva.replace(' ', '_')}_{fecha:%Y%m%d}.csv", "text/csv",
+                       key="dl_curva")
+
+
+tab_curvas, tab_lec, tab_cer, tab_mep, tab_ccl, tab_canje = st.tabs(
+    ["Curvas", "Lecaps (tasa fija)", "CER (tasa real)", "Hard dollar · MEP", "Hard dollar · Cable",
+     "Canje MEP/Cable"])
+
+with tab_curvas:
+    vista_curvas()
 
 with tab_mep:
     t1, t2 = st.tabs(["Tabla de forwards", "Forward histórica"])
