@@ -69,11 +69,15 @@ class TokenVencido(Exception):
     pass
 
 
-def _pedir(token: str, tickers: list[str], moneda: str | None = None) -> dict[str, float]:
-    """Pide precioDirty. Para bonos en dólares se pasa el ticker base (AL30) y moneda mep/ccl."""
+def _pedir(token: str, tickers: list[str], moneda: str | None = None,
+           fecha: str | None = None) -> dict[str, float]:
+    """Pide precioDirty. Para bonos en dólares se pasa el ticker base (AL30) y moneda mep/ccl.
+    Con fecha (AAAA-MM-DD) pide el precio de ese día (parámetro fechaOperacion)."""
     params = {"tickers": [t.strip().lower() for t in tickers], "campos": ["precioDirty"]}
     if moneda:
         params["moneda"] = moneda
+    if fecha:
+        params["fechaOperacion"] = fecha
     _esperar_turno()
     r = requests.get(URL_INDICADORES, headers={"Authorization": f"Bearer {token}"},
                      params=params, timeout=15)
@@ -82,6 +86,8 @@ def _pedir(token: str, tickers: list[str], moneda: str | None = None) -> dict[st
     if r.status_code >= 400:
         raise requests.HTTPError(f"{r.status_code}: {r.text[:200]}", response=r)
     data = r.json()
+    if isinstance(data, dict) and data.get("fechaOperacion"):
+        _estado.setdefault("fechas_respuesta", set()).add(str(data["fechaOperacion"])[:10])
     precios = {}
     if isinstance(data, dict) and "instrumentos" in data:
         for ticker, valores in data["instrumentos"].items():
@@ -91,11 +97,11 @@ def _pedir(token: str, tickers: list[str], moneda: str | None = None) -> dict[st
 
 
 def _pedir_con_reintentos(token: str, tickers: list[str], moneda: str | None = None,
-                          intentos: int = 3) -> dict[str, float]:
+                          intentos: int = 3, fecha: str | None = None) -> dict[str, float]:
     espera = 1.5
     for k in range(intentos):
         try:
-            return _pedir(token, tickers, moneda)
+            return _pedir(token, tickers, moneda, fecha)
         except requests.HTTPError:
             if k == intentos - 1:
                 raise
@@ -105,13 +111,14 @@ def _pedir_con_reintentos(token: str, tickers: list[str], moneda: str | None = N
 
 
 def _pedir_partiendo(token: str, tickers: list[str], precios: dict, rechazados: list,
-                     errores: list, moneda: str | None = None, sufijo: str = "") -> None:
+                     errores: list, moneda: str | None = None, sufijo: str = "",
+                     fecha: str | None = None) -> None:
     """Pide el grupo; si falla, lo parte en dos (menos pedidos que ir de a uno).
 
     Con moneda (mep/ccl) los tickers son base (AL30) y se guardan con sufijo (AL30D / AL30C).
     """
     try:
-        res = _pedir_con_reintentos(token, tickers, moneda)
+        res = _pedir_con_reintentos(token, tickers, moneda, fecha=fecha)
         precios.update({k + sufijo: v for k, v in res.items()})
     except requests.HTTPError as e:
         if len(tickers) == 1:
@@ -119,12 +126,15 @@ def _pedir_partiendo(token: str, tickers: list[str], precios: dict, rechazados: 
             errores.append(str(e))
             return
         mitad = len(tickers) // 2
-        _pedir_partiendo(token, tickers[:mitad], precios, rechazados, errores, moneda, sufijo)
-        _pedir_partiendo(token, tickers[mitad:], precios, rechazados, errores, moneda, sufijo)
+        _pedir_partiendo(token, tickers[:mitad], precios, rechazados, errores, moneda, sufijo, fecha)
+        _pedir_partiendo(token, tickers[mitad:], precios, rechazados, errores, moneda, sufijo, fecha)
 
 
-def get_live_prices(tickers: list[str]) -> dict[str, float]:
+def get_live_prices(tickers: list[str], fecha: str | None = None) -> dict[str, float]:
     """Devuelve {TICKER: precioDirty}. Lanza excepción solo si no trae ningún precio.
+
+    fecha (AAAA-MM-DD, opcional): precios de ese día. get_live_prices.fechas_respuesta
+    trae las fechaOperacion que informó 1816, para verificar que respetó el pedido.
 
     Los tickers que la API rechazó quedan en get_live_prices.rechazados y el
     mensaje de error de 1816 en get_live_prices.errores.
@@ -132,13 +142,17 @@ def get_live_prices(tickers: list[str]) -> dict[str, float]:
     api_key = get_api_key()
     if not api_key:
         raise API1816NoConfigurada("Falta API_1816_KEY (en st.secrets o variable de entorno).")
+    _estado["fechas_respuesta"] = set()
     try:
-        return _consultar(api_key, tickers, _token(api_key))
+        precios = _consultar(api_key, tickers, _token(api_key), fecha)
     except TokenVencido:
-        return _consultar(api_key, tickers, _token(api_key, renovar=True))
+        precios = _consultar(api_key, tickers, _token(api_key, renovar=True), fecha)
+    get_live_prices.fechas_respuesta = sorted(_estado["fechas_respuesta"])
+    return precios
 
 
-def _consultar(api_key: str, tickers: list[str], token: str) -> dict[str, float]:
+def _consultar(api_key: str, tickers: list[str], token: str,
+               fecha: str | None = None) -> dict[str, float]:
     precios: dict[str, float] = {}
     rechazados: list[str] = []
     errores: list[str] = []
@@ -155,7 +169,7 @@ def _consultar(api_key: str, tickers: list[str], token: str) -> dict[str, float]
     for lista, moneda, sufijo in lotes:
         for i in range(0, len(lista), TAMANO_GRUPO):
             _pedir_partiendo(token, lista[i:i + TAMANO_GRUPO], precios, rechazados, errores,
-                             moneda, sufijo)
+                             moneda, sufijo, fecha)
 
     get_live_prices.rechazados = rechazados
     get_live_prices.errores = list(dict.fromkeys(errores))[:3]  # mensajes distintos
@@ -166,3 +180,4 @@ def _consultar(api_key: str, tickers: list[str], token: str) -> dict[str, float]
 
 get_live_prices.rechazados = []
 get_live_prices.errores = []
+get_live_prices.fechas_respuesta = []

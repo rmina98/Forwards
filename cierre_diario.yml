@@ -9,8 +9,16 @@ on:
     - cron: "30 20 * * 1-5"
   workflow_dispatch:
     inputs:
+      desde:
+        description: "Completar días pasados desde (AAAA-MM-DD). Vacío = solo el cierre de hoy"
+        required: false
+        default: ""
+      hasta:
+        description: "Hasta (AAAA-MM-DD). Vacío = ayer"
+        required: false
+        default: ""
       forzar:
-        description: "Guardar aunque sea feriado o fin de semana"
+        description: "Guardar hoy aunque sea feriado o fin de semana"
         type: boolean
         default: false
 
@@ -33,7 +41,15 @@ jobs:
       - name: Bajar cierre de 1816
         env:
           API_1816_KEY: ${{ secrets.API_1816_KEY }}
-        run: python guardar_cierre.py ${{ inputs.forzar && '--forzar' || '' }}
+          DESDE: ${{ inputs.desde }}
+          HASTA: ${{ inputs.hasta }}
+          FORZAR: ${{ inputs.forzar }}
+        run: |
+          ARGS=""
+          [ -n "$DESDE" ] && ARGS="$ARGS --desde $DESDE"
+          [ -n "$HASTA" ] && ARGS="$ARGS --hasta $HASTA"
+          [ "$FORZAR" = "true" ] && ARGS="$ARGS --forzar"
+          python guardar_cierre.py $ARGS
 
       - name: Guardar en el repo
         run: |
@@ -41,5 +57,5 @@ jobs:
           git config user.email "actions@users.noreply.github.com"
           git add precios_1816.csv || exit 0
           git diff --cached --quiet && echo "Sin cambios" && exit 0
-          git commit -m "Cierre 1816 $(TZ=America/Argentina/Buenos_Aires date +%Y-%m-%d)"
+          git commit -m "Cierres 1816 $(TZ=America/Argentina/Buenos_Aires date +%Y-%m-%d)"
           git push
