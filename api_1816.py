@@ -4,6 +4,8 @@ La clave se lee de st.secrets["API_1816_KEY"] (local: .streamlit/secrets.toml;
 Streamlit Cloud: Settings → Secrets) o de la variable de entorno API_1816_KEY.
 Nunca la subas al repo.
 
+Respeta los límites del plan: 1 pedido por segundo y reusa el token (máx. 50 por día).
+
 Los tickers se piden en grupos. Si un grupo falla (p. ej. la API no reconoce algún
 ticker o límite de pedidos), se reintenta con pausas y partiendo el grupo.
 
@@ -37,10 +39,34 @@ def get_api_key() -> str | None:
     return os.environ.get("API_1816_KEY")
 
 
-def _token(api_key: str) -> str:
+# Límites del plan de 1816: máx. 1 pedido por segundo y máx. 50 tokens por día.
+PAUSA_MIN = 1.05          # segundos entre pedidos (cualquier pedido, incluido el token)
+TOKEN_VIGENCIA = 30 * 60  # se reusa el token 30 min; si la API lo rechaza antes, se renueva
+_estado = {"ultimo_pedido": 0.0, "token": None, "token_t": 0.0, "tokens_pedidos": 0}
+
+
+def _esperar_turno() -> None:
+    falta = PAUSA_MIN - (time.monotonic() - _estado["ultimo_pedido"])
+    if falta > 0:
+        time.sleep(falta)
+    _estado["ultimo_pedido"] = time.monotonic()
+
+
+def _token(api_key: str, renovar: bool = False) -> str:
+    """Token reutilizado entre consultas (y entre usuarios de la app) para no pasar 50/día."""
+    vigente = _estado["token"] and time.monotonic() - _estado["token_t"] < TOKEN_VIGENCIA
+    if vigente and not renovar:
+        return _estado["token"]
+    _esperar_turno()
     auth = requests.post(URL_AUTH, json={"apiKey": api_key, "module": "mercado"}, timeout=10)
     auth.raise_for_status()
-    return auth.json()["token"]
+    _estado.update(token=auth.json()["token"], token_t=time.monotonic(),
+                   tokens_pedidos=_estado["tokens_pedidos"] + 1)
+    return _estado["token"]
+
+
+class TokenVencido(Exception):
+    pass
 
 
 def _pedir(token: str, tickers: list[str], moneda: str | None = None) -> dict[str, float]:
@@ -48,8 +74,11 @@ def _pedir(token: str, tickers: list[str], moneda: str | None = None) -> dict[st
     params = {"tickers": [t.strip().lower() for t in tickers], "campos": ["precioDirty"]}
     if moneda:
         params["moneda"] = moneda
+    _esperar_turno()
     r = requests.get(URL_INDICADORES, headers={"Authorization": f"Bearer {token}"},
                      params=params, timeout=15)
+    if r.status_code in (401, 403):
+        raise TokenVencido(r.text[:200])
     if r.status_code >= 400:
         raise requests.HTTPError(f"{r.status_code}: {r.text[:200]}", response=r)
     data = r.json()
@@ -63,7 +92,7 @@ def _pedir(token: str, tickers: list[str], moneda: str | None = None) -> dict[st
 
 def _pedir_con_reintentos(token: str, tickers: list[str], moneda: str | None = None,
                           intentos: int = 3) -> dict[str, float]:
-    espera = 0.6
+    espera = 1.5
     for k in range(intentos):
         try:
             return _pedir(token, tickers, moneda)
@@ -103,8 +132,13 @@ def get_live_prices(tickers: list[str]) -> dict[str, float]:
     api_key = get_api_key()
     if not api_key:
         raise API1816NoConfigurada("Falta API_1816_KEY (en st.secrets o variable de entorno).")
-    token = _token(api_key)
+    try:
+        return _consultar(api_key, tickers, _token(api_key))
+    except TokenVencido:
+        return _consultar(api_key, tickers, _token(api_key, renovar=True))
 
+
+def _consultar(api_key: str, tickers: list[str], token: str) -> dict[str, float]:
     precios: dict[str, float] = {}
     rechazados: list[str] = []
     errores: list[str] = []
@@ -122,7 +156,6 @@ def get_live_prices(tickers: list[str]) -> dict[str, float]:
         for i in range(0, len(lista), TAMANO_GRUPO):
             _pedir_partiendo(token, lista[i:i + TAMANO_GRUPO], precios, rechazados, errores,
                              moneda, sufijo)
-            time.sleep(0.3)
 
     get_live_prices.rechazados = rechazados
     get_live_prices.errores = list(dict.fromkeys(errores))[:3]  # mensajes distintos

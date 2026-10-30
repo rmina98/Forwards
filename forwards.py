@@ -127,7 +127,37 @@ def load_precios(tickers: list[str] | None = None) -> pd.DataFrame:
     df = df.apply(pd.to_numeric, errors="coerce")  # celdas con #N/A, #REF → vacío
     df = df.where(df > 0)  # precios en 0 → vacío
     df = df.dropna(how="all")
-    return normalizar_precios(df[~df.index.duplicated(keep="last")].sort_index())
+    df = normalizar_precios(df[~df.index.duplicated(keep="last")].sort_index())
+
+    # Cierres guardados automáticamente desde 1816: completan lo que falte en el Excel
+    cierres = load_cierres_1816()
+    if not cierres.empty:
+        if tickers is not None:
+            cierres = cierres.reindex(columns=tickers)
+        df = df.combine_first(cierres)  # si una fecha está en los dos, manda el Excel
+        df = df.reindex(columns=tickers) if tickers is not None else df
+        df = df.dropna(how="all").sort_index()
+    return df
+
+
+ARCHIVO_CIERRES = "precios_1816.csv"
+
+
+def load_cierres_1816() -> pd.DataFrame:
+    """precios_1816.csv (lo escribe guardar_cierre.py todos los días). Vacío si no existe."""
+    p = CARPETA / ARCHIVO_CIERRES
+    if not p.exists():
+        return pd.DataFrame()
+    df = pd.read_csv(p)
+    df = df.rename(columns={df.columns[0]: "fecha"})
+    df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+    df = df.dropna(subset=["fecha"])
+    df["fecha"] = df["fecha"].dt.date
+    df = df.set_index("fecha")
+    df.columns = [str(c).strip().upper() for c in df.columns]
+    df = df.apply(pd.to_numeric, errors="coerce")
+    df = df.where(df > 0)
+    return normalizar_precios(df.dropna(how="all"))
 
 
 def normalizar_precios(df: pd.DataFrame) -> pd.DataFrame:

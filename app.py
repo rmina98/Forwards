@@ -18,8 +18,8 @@ TZ = ZoneInfo("America/Argentina/Buenos_Aires")
 
 # ---------------------------------------------------------------- datos
 @st.cache_data
-def base(_mtime: float):
-    # _mtime: si el Excel cambia, se recarga solo.
+def base(mtime_excel: float, mtime_cierres: float):
+    # Si cambia el Excel o el CSV de cierres de 1816, se recarga solo.
     lecaps = fw.load_lecaps()
     lecer = fw.load_lecer()
     flujos = fw.load_flujos_hd()
@@ -46,8 +46,13 @@ def vivo(tickers: tuple[str, ...]):
         return None, None, str(e), ([], [])
 
 
+def _mtime_cierres() -> float:
+    p = fw.CARPETA / fw.ARCHIVO_CIERRES
+    return p.stat().st_mtime if p.exists() else 0.0
+
+
 try:
-    lecaps, lecer, flujos, hd, cer, feriados, hist = base(fw.ruta_inputs().stat().st_mtime)
+    lecaps, lecer, flujos, hd, cer, feriados, hist = base(fw.ruta_inputs().stat().st_mtime, _mtime_cierres())
 except FileNotFoundError as e:
     st.error(str(e))
     st.stop()
@@ -72,7 +77,11 @@ with st.sidebar:
     if usar_api and st.button("🔄 Actualizar precios"):
         _vivo.clear()
 
-live, ts_api, err, (rechazados, errores_api) = (vivo(tuple(todos)) if usar_api else (None, None, None, ([], [])))
+if usar_api:
+    with st.spinner("Trayendo precios de 1816 (máx. 1 pedido por segundo)..."):
+        live, ts_api, err, (rechazados, errores_api) = vivo(tuple(todos))
+else:
+    live, ts_api, err, (rechazados, errores_api) = None, None, None, ([], [])
 
 with st.sidebar:
     if live is not None:

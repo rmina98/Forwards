@@ -1,0 +1,45 @@
+# Guarda el cierre de 1816 todos los días hábiles en precios_1816.csv.
+# Corre lunes a viernes a las 17:30 de Argentina (20:30 UTC). Los feriados los saltea
+# el script leyendo la hoja Feriados del Excel.
+# También se puede correr a mano: pestaña Actions → "Cierre diario 1816" → Run workflow.
+name: Cierre diario 1816
+
+on:
+  schedule:
+    - cron: "30 20 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      forzar:
+        description: "Guardar aunque sea feriado o fin de semana"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  guardar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Bajar cierre de 1816
+        env:
+          API_1816_KEY: ${{ secrets.API_1816_KEY }}
+        run: python guardar_cierre.py ${{ inputs.forzar && '--forzar' || '' }}
+
+      - name: Guardar en el repo
+        run: |
+          git config user.name "cierre-diario-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add precios_1816.csv || exit 0
+          git diff --cached --quiet && echo "Sin cambios" && exit 0
+          git commit -m "Cierre 1816 $(TZ=America/Argentina/Buenos_Aires date +%Y-%m-%d)"
+          git push
