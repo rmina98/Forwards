@@ -75,7 +75,8 @@ venc_hd = hd.set_index("ticker").vencimiento
 # ---------------------------------------------------------------- sidebar
 with st.sidebar:
     st.title("Renta fija")
-    seccion = st.radio("Sección", ["Forwards", "Curvas", "Canje MEP/Cable"], key="seccion")
+    seccion = st.radio("Sección", ["Forwards", "Curvas", "Opción duales", "Canje MEP/Cable"],
+                       key="seccion")
     st.markdown("---")
     st.header("Parámetros")
     tipo = st.radio("Expresar tasas en", ["TEM", "TNA", "TEA"], index=2, horizontal=True)
@@ -119,7 +120,7 @@ else:
     precios_hoy, fecha_px, fuente = hist.iloc[-1], hist.index[-1], "último cierre (Excel)"
 
 st.title({"Forwards": "Forwards implícitas", "Curvas": "Curvas de rendimiento",
-          "Canje MEP/Cable": "Canje MEP / Cable"}[seccion])
+          "Opción duales": "Opción TAMAR de los duales", "Canje MEP/Cable": "Canje MEP / Cable"}[seccion])
 
 # Precios en vivo editables a mano (se resetean al traer precios nuevos de 1816)
 if live is not None:
@@ -675,8 +676,96 @@ def vista_curvas():
                        key="dl_curva")
 
 
+# ---------------------------------------------------------------- opción TAMAR de los duales
+@st.cache_data(show_spinner=False)
+def serie_opcion(modelo_, excluir_, plazo_, firma_precios):
+    # firma_precios: invalida el cache cuando cambian el histórico o los precios de hoy
+    return fw.opcion_duales_historica(hist_full, lecer, duales, cer, feriados, plazo_, modelo_,
+                                      list(excluir_))
+
+
+def vista_opcion_duales():
+    if duales.empty:
+        st.info("No hay duales en la hoja 'Duales CER-TAMAR'.")
+        return
+    st.markdown(
+        "Un dual paga el máximo entre su pata CER y su pata TAMAR, o sea: **dual = bono CER + opción "
+        "de pasarse a TAMAR**. Sin modelo de opciones, el valor implícito de esa opción es "
+        "**precio del dual − valor de su pata CER**, con la pata CER descontada a la TIR real que da "
+        "la curva CER (solo CER puros) para ese plazo.")
+    c1, c2, c3 = st.columns([1, 1, 2])
+    opciones = [fecha_px] + [d for d in reversed(hist.index) if d != fecha_px]
+    fecha_sel = c1.selectbox("Fecha", opciones, key="opc_fecha",
+                             format_func=lambda d: f"{d:%d-%m-%Y}" + (" (hoy)" if d == fecha_px else ""))
+    modelo = c2.selectbox("Ajuste de la curva CER", ["Nelson-Siegel", "Logarítmica"], key="opc_modelo")
+    excluir = c3.multiselect("Excluir CER del ajuste", lecer.ticker.tolist(), key="opc_excl")
+
+    t1, t2 = st.tabs(["Hoy", "Histórico"])
+    with t1:
+        px = precios_de(fecha_sel)
+        t, desc = fw.opcion_duales(px, fecha_sel, lecer, duales, cer, feriados, plazo, modelo, excluir)
+        if t.empty:
+            st.info(f"No hay duales con precio en esa fecha. {desc}")
+        else:
+            st.caption(desc + ".")
+            tabla = t.assign(extrapolado=t.extrapolado.map({True: "sí", False: ""}))
+            tabla.columns = ["Dual", "Vencimiento", "Plazo (años)", "Precio", "Pago CER hoy",
+                             "TIR real curva", "Valor pata CER", "Opción ($ c/100 VN)",
+                             "Opción (% precio)", "TIR real del dual", "TIR que resigna (pb)",
+                             "Curva extrapolada"]
+            st.dataframe(tabla.style.format({
+                "Plazo (años)": "{:.2f}", "Precio": "{:.2f}", "Pago CER hoy": "{:.2f}",
+                "TIR real curva": "{:.2%}", "Valor pata CER": "{:.2f}", "Opción ($ c/100 VN)": "{:.2f}",
+                "Opción (% precio)": "{:.1%}", "TIR real del dual": "{:.2%}",
+                "TIR que resigna (pb)": "{:.0f}"}),
+                use_container_width=True, hide_index=True)
+            st.caption("TIR que resigna = TIR real de la curva − TIR real del dual por su pata CER: lo que "
+                       "el mercado cede en rendimiento real a cambio de la opción. 'Curva extrapolada': el "
+                       "dual vence después del CER puro más largo, así que su valor depende de suponer la "
+                       "curva plana; tomalo con más cuidado.")
+    with t2:
+        firma = (str(hist_full.index[-1]), float(hist_full.reindex(columns=duales.ticker).iloc[-1].fillna(0).sum()),
+                 len(hist_full))
+        with st.spinner("Recalculando la curva CER de cada día..."):
+            h = serie_opcion(modelo, tuple(excluir), plazo, firma)
+        if h.empty:
+            st.info("No hay histórico de precios de los duales.")
+            return
+        c1, c2 = st.columns([2, 1])
+        elegidos = c1.multiselect("Duales", duales.ticker.tolist(), default=duales.ticker.tolist(),
+                                  key="opc_duales")
+        medida = c2.radio("Medida", ["% del precio", "$ cada 100 VN", "TIR que resigna (pb)"],
+                          horizontal=True, key="opc_medida")
+        col = {"% del precio": "opcion_pct", "$ cada 100 VN": "opcion",
+               "TIR que resigna (pb)": "resigna_pb"}[medida]
+        if not elegidos:
+            st.info("Elegí al menos un dual.")
+            return
+        p = h[h.ticker.isin(elegidos)].pivot(index="fecha", columns="ticker", values=col)
+        if len(elegidos) == 1:
+            kpis(p[elegidos[0]].dropna(), pct=(col == "opcion_pct"),
+                 unidad="" if col == "opcion" else " pb")
+        fig = go.Figure()
+        for tk in elegidos:
+            if tk in p:
+                fig.add_scatter(x=p.index, y=p[tk], name=tk, mode="lines", line=dict(width=2))
+        fig.update_layout(height=460, hovermode="x unified", yaxis_title=medida,
+                          yaxis_tickformat=".1%" if col == "opcion_pct" else ".2f",
+                          margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h", y=1.08))
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("Cada día se ajusta la curva CER con los CER puros de ese día y se valúa la pata CER de "
+                   "cada dual. Los duales que vencen después del CER puro más largo usan la curva plana "
+                   "desde ese punto.")
+        st.download_button("Descargar serie (CSV)",
+                           h.pivot(index="fecha", columns="ticker", values=col).to_csv().encode(),
+                           "opcion_duales.csv", "text/csv", key="dl_opc")
+
+
 if seccion == "Curvas":
     vista_curvas()
+
+elif seccion == "Opción duales":
+    vista_opcion_duales()
 
 elif seccion == "Canje MEP/Cable":
     vista_canje()

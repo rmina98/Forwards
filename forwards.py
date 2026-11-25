@@ -677,3 +677,64 @@ def duales_como_cer(duales: pd.DataFrame) -> pd.DataFrame:
 def duales_como_tamar(duales: pd.DataFrame) -> pd.DataFrame:
     """Pata TAMAR del dual con el formato de la hoja Letam (TAMAR + margen)."""
     return duales[["ticker", "emision", "vencimiento", "margen"]].copy().reset_index(drop=True)
+
+
+# ================================================================ OPCIÓN TAMAR DE LOS DUALES
+def opcion_duales(precios: pd.Series, fecha_op: date, lecer: pd.DataFrame, duales: pd.DataFrame,
+                  cer: pd.Series, feriados: set[date], plazo_liq: int = 1,
+                  modelo: str = "Nelson-Siegel", excluir: list[str] | None = None) -> tuple[pd.DataFrame, str]:
+    """Valor implícito de la opción TAMAR de cada dual (sin modelo de opciones):
+
+        opción = precio del dual − valor de su pata CER,
+
+    donde la pata CER (pago CER al vencimiento) se descuenta a la TIR real que da, para ese plazo,
+    la curva CER ajustada con los CER puros del día (sin los que ya conocen el CER del vencimiento).
+    Devuelve (tabla, descripción del ajuste).
+    """
+    liq = sumar_habiles(fecha_op, plazo_liq, feriados) if plazo_liq else fecha_op
+    _, cer_ref = cer_referencia(liq, cer, feriados)
+    vivas = lecer[~lecer.ticker.isin(cer_ya_fijo(lecer, fecha_op, cer, feriados))]
+    if excluir:
+        vivas = vivas[~vivas.ticker.isin(excluir)]
+    pts = puntos_cero_cupon(precios, lecer_a_fecha(vivas, cer_ref), liq).dropna(subset=["TIR"])
+    fn, desc = ajustar_curva(pts.duration, pts.TIR, modelo)
+    if fn is None:
+        return pd.DataFrame(), desc
+    plazo_max = float(pts.duration.max()) if len(pts) else 0.0
+
+    d = lecer_a_fecha(duales_como_cer(duales), cer_ref)
+    d = d[(d.vencimiento > liq) & (d.emision <= fecha_op)].copy()
+    d["precio"] = d.ticker.map(precios)
+    d = d.dropna(subset=["precio"])
+    if d.empty:
+        return pd.DataFrame(), desc
+    d["plazo"] = [(v - liq).days / 365 for v in d.vencimiento]
+    # Más allá del CER puro más largo la curva se extiende plana (no se extrapola la forma del ajuste)
+    d["tir_curva"] = fn(np.minimum(d.plazo.to_numpy(), plazo_max))
+    d["valor_cer"] = d.vf / (1 + d.tir_curva) ** d.plazo
+    d["opcion"] = d.precio - d.valor_cer
+    d["opcion_pct"] = d.opcion / d.precio
+    d["tir_dual"] = (d.vf / d.precio) ** (1 / d.plazo) - 1
+    d["resigna_pb"] = (d.tir_curva - d.tir_dual) * 1e4
+    d["extrapolado"] = d.plazo > plazo_max + 1e-9
+    cols = ["ticker", "vencimiento", "plazo", "precio", "vf", "tir_curva", "valor_cer", "opcion",
+            "opcion_pct", "tir_dual", "resigna_pb", "extrapolado"]
+    return d[cols].reset_index(drop=True), (f"{desc}. CER puro más largo: {plazo_max:.2f} años; "
+                                            "para plazos mayores la curva se extiende plana")
+
+
+def opcion_duales_historica(hist: pd.DataFrame, lecer: pd.DataFrame, duales: pd.DataFrame,
+                            cer: pd.Series, feriados: set[date], plazo_liq: int = 1,
+                            modelo: str = "Nelson-Siegel",
+                            excluir: list[str] | None = None) -> pd.DataFrame:
+    """Serie diaria del valor de la opción (en % del precio y en pesos) para cada dual."""
+    desde = duales.emision.min() if len(duales) else None
+    filas = []
+    for f, row in hist.iterrows():
+        if desde is None or f < desde or row.reindex(duales.ticker).isna().all():
+            continue
+        t, _ = opcion_duales(row, f, lecer, duales, cer, feriados, plazo_liq, modelo, excluir)
+        for _, r in t.iterrows():
+            filas.append({"fecha": pd.Timestamp(f), "ticker": r.ticker, "opcion_pct": r.opcion_pct,
+                          "opcion": r.opcion, "resigna_pb": r.resigna_pb, "extrapolado": r.extrapolado})
+    return pd.DataFrame(filas)
