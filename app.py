@@ -279,7 +279,7 @@ def input_tamar() -> float:
     return v / 100
 
 
-def vista_tabla_letam(proy_hoy: float):
+def vista_tabla_letam(proy_hoy: float, en_margen: bool):
     c1, c2 = st.columns([1, 3])
     opciones = [fecha_px] + [d for d in reversed(hist.index) if d != fecha_px]
     fecha_sel = c1.selectbox("Fecha", opciones, key="fecha_ltm",
@@ -298,13 +298,19 @@ def vista_tabla_letam(proy_hoy: float):
     if fecha_sel == fecha_px and faltan:
         st.caption(f"⚠️ Sin precio para: {', '.join(faltan)}")
 
-    m = fw.tabla_forward(px, bonos, liq, tipo)
+    m = fw.tabla_forward(px, bonos, liq, "TEA" if en_margen else tipo)
     if m.empty:
         st.info("No hay Letam con precio en esa fecha.")
         return
+    if en_margen:
+        m = fw.margen_tamar(m, proy)
     m.index.name = f"{fecha_sel:%d-%b}"
-    st.caption("Diagonal: TIR de cada Letam con la TAMAR proyectada. Fila i, columna j: tasa forward "
-               "implícita entre el vencimiento de i y el de j.")
+    if en_margen:
+        st.caption("Margen sobre TAMAR = 12 × ((1 + TEA)^(1/12) − 1) − TAMAR proyectada. Diagonal: margen "
+                   "de cada Letam. Fila i, columna j: margen de la forward entre el vencimiento de i y el de j.")
+    else:
+        st.caption("Diagonal: TIR (tasa directa) de cada Letam con la TAMAR proyectada. Fila i, columna j: "
+                   "tasa forward implícita entre el vencimiento de i y el de j.")
     st.dataframe(estilo_matriz(m), use_container_width=True, height=36 * (len(m) + 1) + 3)
 
     with st.expander("Detalle por Letam"):
@@ -330,7 +336,7 @@ def vista_tabla_letam(proy_hoy: float):
                    "TIR.NO.PER (base 365).")
 
 
-def vista_historica_letam(proy_hoy: float):
+def vista_historica_letam(proy_hoy: float, en_margen: bool):
     vivas = letam[letam.vencimiento > hoy].ticker.tolist()
     if len(vivas) < 2:
         st.info("Hacen falta al menos dos Letam vivas.")
@@ -339,20 +345,27 @@ def vista_historica_letam(proy_hoy: float):
     a = c1.selectbox("Letam corta", vivas, index=0, key="a_ltm")
     resto = [t for t in vivas if t != a]
     b = c2.selectbox("Letam larga", resto, index=len(resto) - 1, key="b_ltm")
-    ver_tir = c3.checkbox("Mostrar TIR de cada una", value=True, key="tir_ltm")
+    ver_tir = c3.checkbox("Mostrar cada Letam", value=True, key="tir_ltm")
 
-    s = fw.forward_historica_letam(hist_full, letam, a, b, tamar, feriados, plazo, tipo,
-                                   proyectada_hoy=proy_hoy if live is not None else None, hoy=hoy)
+    proy_vivo = proy_hoy if live is not None else None
+    s = fw.forward_historica_letam(hist_full, letam, a, b, tamar, feriados, plazo,
+                                   "TEA" if en_margen else tipo, proyectada_hoy=proy_vivo, hoy=hoy)
     if s.empty:
         st.info("No hay precios en común para ese par.")
         return
+    if en_margen:  # cada día contra la TAMAR proyectada de ese día
+        proys = pd.Series([proy_vivo if (proy_vivo is not None and d.date() == hoy)
+                           else fw.tamar_al(d.date(), tamar) for d in s.index], index=s.index)
+        s = s.apply(lambda col: fw.margen_tamar(col, proys))
     corto, largo = [c.replace("TIR ", "") for c in s.columns[:2]]
     nombre_fwd = f"Forward {corto} → {largo}"
     kpis(s["Forward"])
     s_graf = s.rename(columns={"Forward": nombre_fwd})[[nombre_fwd, f"TIR {corto}", f"TIR {largo}"]]
-    grafico_serie(s_graf if ver_tir else s_graf[[nombre_fwd]], tipo)
+    grafico_serie(s_graf if ver_tir else s_graf[[nombre_fwd]],
+                  "Margen sobre TAMAR" if en_margen else tipo)
     st.caption("Cada día se proyecta la TAMAR futura igual a la última publicada ese día "
-               "(hoy, la TAMAR proyectada de arriba).")
+               "(hoy, la TAMAR proyectada de arriba)"
+               + (". En modo margen, las líneas de cada Letam son su margen sobre TAMAR." if en_margen else "."))
     st.download_button("Descargar serie (CSV)", s.to_csv().encode(),
                        f"forward_{corto}_{largo}.csv", "text/csv", key="dl_ltm")
 
@@ -506,7 +519,7 @@ def precios_de(fecha):
     return precios_hoy if fecha == fecha_px else hist.loc[fecha]
 
 
-def puntos_curva(curva: str, fecha, sel_hd: list[str]) -> pd.DataFrame:
+def puntos_curva(curva: str, fecha, sel_hd: list[str], en_margen: bool = False) -> pd.DataFrame:
     px = precios_de(fecha)
     liq = fw.sumar_habiles(fecha, plazo, feriados) if plazo else fecha
     if curva == "Tasa fija":
@@ -520,6 +533,10 @@ def puntos_curva(curva: str, fecha, sel_hd: list[str]) -> pd.DataFrame:
         proy = (st.session_state["tamar_proy"] / 100
                 if fecha == fecha_px and "tamar_proy" in st.session_state else fw.tamar_al(fecha, tamar))
         p = fw.puntos_cero_cupon(px, fw.letam_a_fecha(letam, fecha, tamar, proy, feriados), liq)
+        if en_margen:  # TIR (TEA) → margen sobre TAMAR, sin pasar por la unidad de la barra lateral
+            p = p.dropna(subset=["TIR", "duration"]).copy()
+            p["TIR"] = fw.margen_tamar(p["TIR"], proy)
+            return p.sort_values("duration").reset_index(drop=True)
     else:
         p = fw.puntos_hd(px, flujos, liq, "D" if curva == "HD MEP" else "C", sel_hd)
     p = p.dropna(subset=["TIR", "duration"]).copy()
@@ -538,6 +555,9 @@ def vista_curvas():
                      key="curva_tipo")
     modelo = c2.selectbox("Ajuste", ["Nelson-Siegel", "Logarítmica"], key="curva_modelo")
     sel_hd = filtro_ley("curva") if curva.startswith("HD") else []
+    en_margen = curva == "TAMAR" and st.radio(
+        "Eje vertical", ["Tasa directa", "Margen sobre TAMAR"], horizontal=True,
+        key="curva_tamar_eje") == "Margen sobre TAMAR"
 
     c1, c2, c3 = st.columns([1, 1, 2])
     opciones = [fecha_px] + [d for d in reversed(hist.index) if d != fecha_px]
@@ -553,7 +573,7 @@ def vista_curvas():
         dias = {"1 semana antes": 7, "1 mes antes": 30, "3 meses antes": 91}[comp]
         fecha_c = fecha_anterior(fecha - timedelta(days=dias))
 
-    p = puntos_curva(curva, fecha, sel_hd)
+    p = puntos_curva(curva, fecha, sel_hd, en_margen)
     if len(p) < 2:
         st.info("No hay suficientes bonos con precio para armar la curva en esa fecha.")
         return
@@ -569,19 +589,22 @@ def vista_curvas():
 
     pc, fn_c = None, None
     if fecha_c is not None:
-        pc = puntos_curva(curva, fecha_c, sel_hd)
+        pc = puntos_curva(curva, fecha_c, sel_hd, en_margen)
         pc = pc[~pc.ticker.isin(excluir)]
         if len(pc) >= 2:
             fn_c, _ = fw.ajustar_curva(pc.duration, pc.TIR, modelo)
             p = p.merge(pc[["ticker", "TIR"]].rename(columns={"TIR": "TIR_c"}), on="ticker", how="left")
             p["var"] = (p.TIR - p.TIR_c) * 1e4
 
-    unidad = f"{tipo}{' real' if curva == 'CER' else ''}"
+    unidad = "s/TAMAR" if en_margen else f"{tipo}{' real' if curva == 'CER' else ''}"
+    nom = "Margen" if en_margen else "TIR"
     if curva == "TAMAR":
         st.caption("Letam: TIR con el pago final estimado con la TAMAR proyectada (hoy, la de la solapa "
                    "Letam; en otras fechas, la publicada ese día). Con menos de 6 especies el ajuste "
                    "pasa a logarítmico.")
-    st.caption(f"{desc}. Ajuste sobre TIR ({unidad}) contra duration en años. Spread = TIR − curva: "
+    if en_margen:
+        st.caption("Margen sobre TAMAR = 12 × ((1 + TEA)^(1/12) − 1) − TAMAR proyectada.")
+    st.caption(f"{desc}. Ajuste sobre {nom} ({unidad}) contra duration en años. Spread = {nom} − curva: "
                "positivo = el bono rinde más que la curva (**barato**); negativo = **rico**.")
 
     # ---- gráfico
@@ -593,7 +616,8 @@ def vista_curvas():
         fig.add_scatter(x=pc.duration, y=pc.TIR, mode="markers", name=f"Bonos {fecha_c:%d-%m-%y}",
                         marker=dict(color=GRIS, size=8, symbol="circle-open"),
                         customdata=pc[["ticker"]],
-                        hovertemplate="%{customdata[0]}<br>Duration %{x:.2f}<br>TIR %{y:.2%}<extra></extra>")
+                        hovertemplate="%{customdata[0]}<br>Duration %{x:.2f}<br>" + nom
+                                      + " %{y:.2%}<extra></extra>")
     fig.add_scatter(x=xs, y=fn(xs), mode="lines", name=f"Curva {fecha:%d-%m-%y}",
                     line=dict(color=AZUL, width=2), hoverinfo="skip")
     for incl, nombre, simbolo in [(usar, f"Bonos {fecha:%d-%m-%y}", "circle"),
@@ -606,23 +630,24 @@ def vista_curvas():
                         marker=dict(color=AZUL, size=9, symbol=simbolo,
                                     line=dict(color="white", width=1)),
                         customdata=np.column_stack([q.ticker, q.spread]),
-                        hovertemplate="%{customdata[0]}<br>Duration %{x:.2f}<br>TIR %{y:.2%}"
-                                      "<br>Spread %{customdata[1]:+.0f} pb<extra></extra>")
-    fig.update_layout(height=520, xaxis_title="Duration (años)", yaxis_title=unidad,
+                        hovertemplate="%{customdata[0]}<br>Duration %{x:.2f}<br>" + nom
+                                      + " %{y:.2%}<br>Spread %{customdata[1]:+.0f} pb<extra></extra>")
+    fig.update_layout(height=520, xaxis_title="Duration (años)",
+                      yaxis_title="Margen sobre TAMAR" if en_margen else unidad,
                       yaxis_tickformat=".1%", hovermode="closest",
                       margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h", y=1.08))
     st.plotly_chart(fig, use_container_width=True)
 
     # ---- tabla
     cols = {"ticker": "Ticker", "vencimiento": "Vencimiento", "duration": "Duration",
-            "precio": "Precio", "TIR": f"TIR ({unidad})", "curva": "TIR curva",
+            "precio": "Precio", "TIR": f"{nom} ({unidad})", "curva": f"{nom} curva",
             "spread": "Spread (pb)"}
     if "var" in p:
-        cols["var"] = f"Δ TIR vs {fecha_c:%d-%m} (pb)"
+        cols["var"] = f"Δ {nom} vs {fecha_c:%d-%m} (pb)"
     t = p[list(cols)].rename(columns=cols)
     lim = max(float(p.spread.abs().max()), 1.0)
-    fmt = {"Duration": "{:.2f}", "Precio": "{:.3f}", f"TIR ({unidad})": "{:.2%}",
-           "TIR curva": "{:.2%}", "Spread (pb)": "{:+.0f}"}
+    fmt = {"Duration": "{:.2f}", "Precio": "{:.3f}", f"{nom} ({unidad})": "{:.2%}",
+           f"{nom} curva": "{:.2%}", "Spread (pb)": "{:+.0f}"}
     if "var" in p:
         fmt[cols["var"]] = "{:+.0f}"
     st.dataframe(t.style.format(fmt, na_rep="")
@@ -660,11 +685,13 @@ else:  # Forwards
 
     with tab_ltm:
         proy = input_tamar()
+        en_margen = st.radio("Mostrar", ["Tasa directa", "Margen sobre TAMAR"], horizontal=True,
+                             key="ltm_vista") == "Margen sobre TAMAR"
         t1, t2 = st.tabs(["Tabla de forwards", "Forward histórica"])
         with t1:
-            vista_tabla_letam(proy)
+            vista_tabla_letam(proy, en_margen)
         with t2:
-            vista_historica_letam(proy)
+            vista_historica_letam(proy, en_margen)
 
     with tab_mep:
         t1, t2 = st.tabs(["Tabla de forwards", "Forward histórica"])

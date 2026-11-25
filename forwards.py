@@ -629,3 +629,10 @@ def forward_historica_letam(hist: pd.DataFrame, letam: pd.DataFrame, corto: str,
     if not filas:
         return pd.DataFrame()
     return pd.DataFrame(filas).set_index("fecha")
+
+
+def margen_tamar(tea, tamar_proy):
+    """Margen sobre TAMAR como en la planilla: 12·((1 + TEA)^(1/12) − 1) − TAMAR proyectada.
+    TEA = TIR.NO.PER (base 365). Acepta escalares, arrays o Series (TAMAR por fecha)."""
+    tea = np.asarray(tea, dtype=float) if not isinstance(tea, (pd.Series, pd.DataFrame)) else tea
+    return ((1 + tea) ** (1 / 12) - 1) * 12 - tamar_proy
