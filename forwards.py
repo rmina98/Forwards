@@ -636,3 +636,44 @@ def margen_tamar(tea, tamar_proy):
     TEA = TIR.NO.PER (base 365). Acepta escalares, arrays o Series (TAMAR por fecha)."""
     tea = np.asarray(tea, dtype=float) if not isinstance(tea, (pd.Series, pd.DataFrame)) else tea
     return ((1 + tea) ** (1 / 12) - 1) * 12 - tamar_proy
+
+
+# ================================================================ DUALES CER / TAMAR
+HOJA_DUALES = "Duales CER-TAMAR"
+
+
+def load_duales() -> pd.DataFrame:
+    """Hoja 'Duales CER-TAMAR': Ticker | Emisión | Vencimiento | Tasa CER | CER inicial | Margen tamar.
+
+    Pagan el máximo entre la pata CER (100·(1+Tasa CER)·CER ref/CER inicial) y la pata TAMAR
+    (TAMAR promedio + margen, capitalizable como las Letam). Vacío si la hoja no existe.
+    """
+    try:
+        raw = _hoja(HOJA_DUALES)
+    except ValueError:  # hoja inexistente
+        return pd.DataFrame(columns=["ticker", "emision", "vencimiento", "tasa_cer", "cer_ini", "margen"])
+    df = raw.iloc[:, :6].copy()
+    df.columns = ["ticker", "emision", "vencimiento", "tasa_cer", "cer_ini", "margen"]
+    df = df.dropna(subset=["ticker", "emision", "vencimiento"])
+    df["ticker"] = df["ticker"].astype(str).str.strip().str.upper()
+    df = df.drop_duplicates("ticker")
+    df["emision"] = pd.to_datetime(df["emision"]).dt.date
+    df["vencimiento"] = pd.to_datetime(df["vencimiento"]).dt.date
+    for c in ["tasa_cer", "cer_ini", "margen"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["tasa_cer"] = df["tasa_cer"].fillna(0.0)
+    df["margen"] = df["margen"].fillna(0.0)
+    return df.sort_values("vencimiento").reset_index(drop=True)
+
+
+def duales_como_cer(duales: pd.DataFrame) -> pd.DataFrame:
+    """Pata CER del dual con el formato de la hoja LECER (para tablas, forwards y curva CER)."""
+    df = duales.dropna(subset=["cer_ini"])[["ticker", "emision", "vencimiento", "tasa_cer", "cer_ini"]]
+    df = df.rename(columns={"tasa_cer": "tasa"}).copy()
+    df["vf_base"] = 100 * (1 + df["tasa"]) / df["cer_ini"]
+    return df.reset_index(drop=True)
+
+
+def duales_como_tamar(duales: pd.DataFrame) -> pd.DataFrame:
+    """Pata TAMAR del dual con el formato de la hoja Letam (TAMAR + margen)."""
+    return duales[["ticker", "emision", "vencimiento", "margen"]].copy().reset_index(drop=True)

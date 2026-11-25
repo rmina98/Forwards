@@ -25,10 +25,11 @@ def base(mtime_excel: float, mtime_cierres: float):
     flujos = fw.load_flujos_hd()
     hd = fw.bonos_hd(flujos)
     letam = fw.load_letam()
+    duales = fw.load_duales()
     tickers = (lecaps.ticker.tolist() + lecer.ticker.tolist() + letam.ticker.tolist()
-               + [t + s for t in hd.ticker for s in ("D", "C")])
+               + duales.ticker.tolist() + [t + s for t in hd.ticker for s in ("D", "C")])
     return (lecaps, lecer, flujos, hd, fw.load_cer(), fw.load_feriados(),
-            fw.load_precios(tickers), letam, fw.load_tamar())
+            fw.load_precios(tickers), letam, fw.load_tamar(), duales)
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -54,16 +55,20 @@ def _mtime_cierres() -> float:
 
 try:
     (lecaps, lecer, flujos, hd, cer, feriados, hist, letam,
-     tamar) = base(fw.ruta_inputs().stat().st_mtime, _mtime_cierres())
+     tamar, duales) = base(fw.ruta_inputs().stat().st_mtime, _mtime_cierres())
 except FileNotFoundError as e:
     st.error(str(e))
     st.stop()
 hoy = datetime.now(TZ).date()
 hd_d = [t + "D" for t in hd.ticker]
 hd_c = [t + "C" for t in hd.ticker]
-todos = lecaps.ticker.tolist() + lecer.ticker.tolist() + letam.ticker.tolist() + hd_d + hd_c
+todos = (lecaps.ticker.tolist() + lecer.ticker.tolist() + letam.ticker.tolist()
+         + duales.ticker.tolist() + hd_d + hd_c)
+duales_cer = fw.duales_como_cer(duales)      # pata CER, formato LECER
+duales_tamar = fw.duales_como_tamar(duales)  # pata TAMAR, formato Letam
+es_dual = set(duales.ticker)
 tipo_de = {**{t: "Lecap" for t in lecaps.ticker}, **{t: "CER" for t in lecer.ticker},
-           **{t: "Letam" for t in letam.ticker},
+           **{t: "Letam" for t in letam.ticker}, **{t: "Dual CER-TAMAR" for t in duales.ticker},
            **{t: "HD MEP" for t in hd_d}, **{t: "HD Cable" for t in hd_c}}
 venc_hd = hd.set_index("ticker").vencimiento
 
@@ -92,7 +97,9 @@ with st.sidebar:
         n_cer = live.reindex(lecer.ticker).notna().sum()
         n_hd = live.reindex(hd_d + hd_c).notna().sum()
         n_ltm = live.reindex(letam.ticker).notna().sum()
-        st.success(f"1816 conectado: {n_lec} Lecaps, {n_cer} CER, {n_ltm} Letam y {n_hd} precios HD (D/C), "
+        n_dua = live.reindex(duales.ticker).notna().sum()
+        st.success(f"1816 conectado: {n_lec} Lecaps, {n_cer} CER, {n_ltm} Letam, {n_dua} duales y "
+                   f"{n_hd} precios HD (D/C), "
                    f"consulta de las {ts_api:%H:%M:%S}")
         ahora = datetime.now(TZ)
         if not (fw.es_habil(hoy, feriados) and (10, 30) <= (ahora.hour, ahora.minute) < (17, 0)):
@@ -119,7 +126,7 @@ if live is not None:
     st.session_state.setdefault("reset_editor", 0)
     with st.expander("✏️ Precios de hoy (editables)", expanded=False):
         venc = pd.concat([lecaps.set_index("ticker").vencimiento, lecer.set_index("ticker").vencimiento,
-                          letam.set_index("ticker").vencimiento,
+                          letam.set_index("ticker").vencimiento, duales.set_index("ticker").vencimiento,
                           venc_hd.rename(lambda t: t + "D"), venc_hd.rename(lambda t: t + "C")])
         base_px = pd.DataFrame({
             "Tipo": [tipo_de[t] for t in todos],
@@ -279,7 +286,7 @@ def input_tamar() -> float:
     return v / 100
 
 
-def vista_tabla_letam(proy_hoy: float, en_margen: bool):
+def vista_tabla_letam(proy_hoy: float, en_margen: bool, base_ltm: pd.DataFrame):
     c1, c2 = st.columns([1, 3])
     opciones = [fecha_px] + [d for d in reversed(hist.index) if d != fecha_px]
     fecha_sel = c1.selectbox("Fecha", opciones, key="fecha_ltm",
@@ -287,7 +294,7 @@ def vista_tabla_letam(proy_hoy: float, en_margen: bool):
     px = precios_hoy if fecha_sel == fecha_px else hist.loc[fecha_sel]
     liq = fw.sumar_habiles(fecha_sel, plazo, feriados) if plazo else fecha_sel
     proy = proy_hoy if fecha_sel == fecha_px else fw.tamar_al(fecha_sel, tamar)
-    bonos = fw.letam_a_fecha(letam, fecha_sel, tamar, proy, feriados)
+    bonos = fw.letam_a_fecha(base_ltm, fecha_sel, tamar, proy, feriados)
     c2.markdown(f"**Precios:** {fuente if fecha_sel == fecha_px else 'cierre histórico'} · "
                 f"**Liquidación:** {liq:%d-%m-%Y} · **TAMAR proyectada:** {proy:.2%}"
                 + ("" if fecha_sel == fecha_px else " (la publicada ese día)"))
@@ -336,8 +343,8 @@ def vista_tabla_letam(proy_hoy: float, en_margen: bool):
                    "TIR.NO.PER (base 365).")
 
 
-def vista_historica_letam(proy_hoy: float, en_margen: bool):
-    vivas = letam[letam.vencimiento > hoy].ticker.tolist()
+def vista_historica_letam(proy_hoy: float, en_margen: bool, base_ltm: pd.DataFrame):
+    vivas = base_ltm[base_ltm.vencimiento > hoy].ticker.tolist()
     if len(vivas) < 2:
         st.info("Hacen falta al menos dos Letam vivas.")
         return
@@ -348,7 +355,7 @@ def vista_historica_letam(proy_hoy: float, en_margen: bool):
     ver_tir = c3.checkbox("Mostrar cada Letam", value=True, key="tir_ltm")
 
     proy_vivo = proy_hoy if live is not None else None
-    s = fw.forward_historica_letam(hist_full, letam, a, b, tamar, feriados, plazo,
+    s = fw.forward_historica_letam(hist_full, base_ltm, a, b, tamar, feriados, plazo,
                                    "TEA" if en_margen else tipo, proyectada_hoy=proy_vivo, hoy=hoy)
     if s.empty:
         st.info("No hay precios en común para ese par.")
@@ -519,20 +526,23 @@ def precios_de(fecha):
     return precios_hoy if fecha == fecha_px else hist.loc[fecha]
 
 
-def puntos_curva(curva: str, fecha, sel_hd: list[str], en_margen: bool = False) -> pd.DataFrame:
+def puntos_curva(curva: str, fecha, sel_hd: list[str], en_margen: bool = False,
+                 con_duales: bool = False) -> pd.DataFrame:
     px = precios_de(fecha)
     liq = fw.sumar_habiles(fecha, plazo, feriados) if plazo else fecha
     if curva == "Tasa fija":
         p = fw.puntos_cero_cupon(px, lecaps, liq)
     elif curva == "CER":
-        fijos = fw.cer_ya_fijo(lecer, fecha, cer, feriados)
-        vivas = lecer[~lecer.ticker.isin(fijos)]
+        base_c = pd.concat([lecer, duales_cer], ignore_index=True) if con_duales else lecer
+        fijos = fw.cer_ya_fijo(base_c, fecha, cer, feriados)
+        vivas = base_c[~base_c.ticker.isin(fijos)]
         p = fw.puntos_cero_cupon(px, fw.lecer_a_fecha(vivas, coef_cer(liq)), liq)
     elif curva == "TAMAR":
         # Hoy: la TAMAR proyectada de la solapa Letam (si se tocó); otra fecha: la publicada ese día
         proy = (st.session_state["tamar_proy"] / 100
                 if fecha == fecha_px and "tamar_proy" in st.session_state else fw.tamar_al(fecha, tamar))
-        p = fw.puntos_cero_cupon(px, fw.letam_a_fecha(letam, fecha, tamar, proy, feriados), liq)
+        base_t = pd.concat([letam, duales_tamar], ignore_index=True) if con_duales else letam
+        p = fw.puntos_cero_cupon(px, fw.letam_a_fecha(base_t, fecha, tamar, proy, feriados), liq)
         if en_margen:  # TIR (TEA) → margen sobre TAMAR, sin pasar por la unidad de la barra lateral
             p = p.dropna(subset=["TIR", "duration"]).copy()
             p["TIR"] = fw.margen_tamar(p["TIR"], proy)
@@ -558,6 +568,11 @@ def vista_curvas():
     en_margen = curva == "TAMAR" and st.radio(
         "Eje vertical", ["Tasa directa", "Margen sobre TAMAR"], horizontal=True,
         key="curva_tamar_eje") == "Margen sobre TAMAR"
+    con_duales = curva in ("CER", "TAMAR") and (not duales.empty) and st.checkbox(
+        f"Incluir duales CER-TAMAR (pata {curva})", key="curva_duales")
+    if con_duales:
+        st.caption(f"ℹ️ Duales con ◆. Pagan el máximo entre CER y TAMAR: su tasa por la pata {curva} es un "
+                   "piso. Si no querés que muevan la curva, sacalos del ajuste.")
 
     c1, c2, c3 = st.columns([1, 1, 2])
     opciones = [fecha_px] + [d for d in reversed(hist.index) if d != fecha_px]
@@ -573,12 +588,12 @@ def vista_curvas():
         dias = {"1 semana antes": 7, "1 mes antes": 30, "3 meses antes": 91}[comp]
         fecha_c = fecha_anterior(fecha - timedelta(days=dias))
 
-    p = puntos_curva(curva, fecha, sel_hd, en_margen)
+    p = puntos_curva(curva, fecha, sel_hd, en_margen, con_duales)
     if len(p) < 2:
         st.info("No hay suficientes bonos con precio para armar la curva en esa fecha.")
         return
     excluir = st.multiselect("Excluir del ajuste (se siguen mostrando)", p.ticker.tolist(),
-                             key=f"curva_excl_{curva}")
+                             key=f"curva_excl_{curva}_{int(con_duales)}")
     usar = ~p.ticker.isin(excluir)
     fn, desc = fw.ajustar_curva(p.duration[usar], p.TIR[usar], modelo)
     if fn is None:
@@ -589,7 +604,7 @@ def vista_curvas():
 
     pc, fn_c = None, None
     if fecha_c is not None:
-        pc = puntos_curva(curva, fecha_c, sel_hd, en_margen)
+        pc = puntos_curva(curva, fecha_c, sel_hd, en_margen, con_duales)
         pc = pc[~pc.ticker.isin(excluir)]
         if len(pc) >= 2:
             fn_c, _ = fw.ajustar_curva(pc.duration, pc.TIR, modelo)
@@ -620,7 +635,9 @@ def vista_curvas():
                                       + " %{y:.2%}<extra></extra>")
     fig.add_scatter(x=xs, y=fn(xs), mode="lines", name=f"Curva {fecha:%d-%m-%y}",
                     line=dict(color=AZUL, width=2), hoverinfo="skip")
-    for incl, nombre, simbolo in [(usar, f"Bonos {fecha:%d-%m-%y}", "circle"),
+    dual = p.ticker.isin(es_dual)
+    for incl, nombre, simbolo in [(usar & ~dual, f"Bonos {fecha:%d-%m-%y}", "circle"),
+                                  (usar & dual, "Duales CER-TAMAR", "diamond"),
                                   (~usar, "Excluidos del ajuste", "x")]:
         q = p[incl]
         if q.empty:
@@ -677,21 +694,33 @@ else:  # Forwards
             vista_historica("lec", lecaps, es_cer=False)
 
     with tab_cer:
+        incl = (not duales.empty) and st.checkbox(
+            "Incluir duales CER-TAMAR (pata CER)", key="dual_cer")
+        if incl:
+            st.caption("ℹ️ Los duales pagan el máximo entre CER y TAMAR: su TIR real por la pata CER es un "
+                       "piso, no se compara uno a uno con un CER puro.")
+        base_cer = pd.concat([lecer, duales_cer], ignore_index=True) if incl else lecer
         t1, t2 = st.tabs(["Tabla de forwards", "Forward histórica"])
         with t1:
-            vista_tabla("cer", lecer, es_cer=True)
+            vista_tabla("cer", base_cer, es_cer=True)
         with t2:
-            vista_historica("cer", lecer, es_cer=True)
+            vista_historica("cer", base_cer, es_cer=True)
 
     with tab_ltm:
         proy = input_tamar()
         en_margen = st.radio("Mostrar", ["Tasa directa", "Margen sobre TAMAR"], horizontal=True,
                              key="ltm_vista") == "Margen sobre TAMAR"
+        incl = (not duales.empty) and st.checkbox(
+            "Incluir duales CER-TAMAR (pata TAMAR: TAMAR + margen del dual)", key="dual_ltm")
+        if incl:
+            st.caption("ℹ️ Los duales pagan el máximo entre CER y TAMAR: su tasa por la pata TAMAR es un "
+                       "piso, no se compara uno a uno con una Letam pura.")
+        base_ltm = pd.concat([letam, duales_tamar], ignore_index=True) if incl else letam
         t1, t2 = st.tabs(["Tabla de forwards", "Forward histórica"])
         with t1:
-            vista_tabla_letam(proy, en_margen)
+            vista_tabla_letam(proy, en_margen, base_ltm)
         with t2:
-            vista_historica_letam(proy, en_margen)
+            vista_historica_letam(proy, en_margen, base_ltm)
 
     with tab_mep:
         t1, t2 = st.tabs(["Tabla de forwards", "Forward histórica"])

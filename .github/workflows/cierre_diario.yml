@@ -13,6 +13,10 @@ on:
         description: "Hasta (AAAA-MM-DD). Vacío = ayer"
         required: false
         default: ""
+      solo:
+        description: "Solo estas especies (coma) o una hoja: Duales, Letam, LECER, Lecaps. Vacío = todas"
+        required: false
+        default: ""
       forzar:
         description: "Guardar hoy aunque sea feriado o fin de semana"
         type: boolean
@@ -44,6 +48,7 @@ jobs:
           DESDE: ${{ inputs.desde }}
           HASTA: ${{ inputs.hasta }}
           FORZAR: ${{ inputs.forzar }}
+          SOLO: ${{ inputs.solo }}
         run: |
           ARGS=""
           [ -n "$DESDE" ] && ARGS="$ARGS --desde $DESDE"

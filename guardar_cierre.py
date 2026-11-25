@@ -9,6 +9,7 @@ Uso normal (lo corre GitHub Actions los días hábiles después del cierre):
 Completar días que faltan (precios de fechas pasadas):
     python guardar_cierre.py --desde 2026-10-16
     python guardar_cierre.py --desde 2026-10-16 --hasta 2026-10-29
+    python guardar_cierre.py --desde 2026-04-30 --solo Duales     (solo esas especies)
 
 En GitHub: pestaña Actions → "Cierre diario 1816" → Run workflow, completando "desde".
 
@@ -22,6 +23,7 @@ La clave se lee de la variable de entorno API_1816_KEY.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -36,17 +38,22 @@ TZ = ZoneInfo("America/Argentina/Buenos_Aires")
 ARCHIVO = Path(__file__).parent / fw.ARCHIVO_CIERRES
 
 
-def tickers_vivos(dia: date) -> list[str]:
+def tickers_vivos(dia: date, solo: set[str] | None = None) -> list[str]:
     lecaps = fw.load_lecaps()
     lecer = fw.load_lecer()
     hd = fw.bonos_hd(fw.load_flujos_hd())
     letam = fw.load_letam()
     letam = letam[(letam.vencimiento >= dia) & (letam.emision <= dia)]  # ya emitidas y vivas
+    duales = fw.load_duales()
+    duales = duales[(duales.vencimiento >= dia) & (duales.emision <= dia)]
     vivos = (lecaps[lecaps.vencimiento >= dia].ticker.tolist()
              + lecer[lecer.vencimiento >= dia].ticker.tolist()
-             + letam.ticker.tolist())
+             + letam.ticker.tolist() + duales.ticker.tolist())
     hd_vivos = hd[hd.vencimiento >= dia].ticker.tolist()
-    return vivos + [t + s for t in hd_vivos for s in ("D", "C")]
+    todos = vivos + [t + s for t in hd_vivos for s in ("D", "C")]
+    if solo:  # acepta el ticker exacto o la base de un HD (GD30 → GD30D y GD30C)
+        todos = [t for t in todos if t in solo or (t[-1] in "DC" and t[:-1] in solo)]
+    return todos
 
 
 def leer_csv() -> pd.DataFrame:
@@ -58,22 +65,23 @@ def leer_csv() -> pd.DataFrame:
 
 
 def guardar(filas: dict[date, dict[str, float]]) -> None:
+    """Agrega o actualiza celda por celda: lo nuevo pisa lo guardado; lo que no se pidió queda."""
     tabla = leer_csv()
     nuevas = pd.DataFrame.from_dict(filas, orient="index")
     nuevas.index.name = "Fecha"
-    if not tabla.empty:
-        tabla = tabla.drop(index=list(filas), errors="ignore")  # una fecha repetida se reemplaza
-        tabla = pd.concat([tabla, nuevas])
-    else:
-        tabla = nuevas
+    tabla = nuevas.combine_first(tabla) if not tabla.empty else nuevas
+    tabla.index.name = "Fecha"
     tabla = tabla.sort_index()
     tabla = tabla[sorted(tabla.columns)]
     tabla.to_csv(ARCHIVO, float_format="%.6f")
     print(f"Guardado en {ARCHIVO.name}: {len(tabla)} días, {tabla.shape[1]} tickers.")
 
 
-def bajar(dia: date, historico: bool) -> dict[str, float]:
-    tickers = tickers_vivos(dia)
+def bajar(dia: date, historico: bool, solo: set[str] | None = None) -> dict[str, float]:
+    tickers = tickers_vivos(dia, solo)
+    if not tickers:
+        print(f"{dia}: ninguna especie viva para pedir.")
+        return {}
     precios = get_live_prices(tickers, fecha=dia.isoformat() if historico else None)
     if historico:
         devueltas = get_live_prices.fechas_respuesta
@@ -93,14 +101,17 @@ def main() -> int:
     ap.add_argument("--desde", help="AAAA-MM-DD: completar días pasados desde esta fecha")
     ap.add_argument("--hasta", help="AAAA-MM-DD: hasta esta fecha (por defecto, ayer)")
     ap.add_argument("--forzar", action="store_true", help="guardar hoy aunque no sea hábil")
+    ap.add_argument("--solo", help="tickers separados por coma (o el nombre de una hoja: Duales, "
+                                   "Letam, LECER, Lecaps): pedir solo esos y completar el resto tal cual")
     a = ap.parse_args()
+    solo = parsear_solo(a.solo or os.environ.get("SOLO"))  # en GitHub llega por variable de entorno
 
     ahora = datetime.now(TZ)
     hoy = ahora.date()
     feriados = fw.load_feriados()
 
     if a.forzar:  # precio en vivo de hoy, aunque no sea hábil
-        guardar({hoy: bajar(hoy, historico=False)})
+        guardar({hoy: bajar(hoy, historico=False, solo=solo)})
         return 0
 
     if a.desde:
@@ -123,7 +134,9 @@ def main() -> int:
     filas, fallidos = {}, []
     for d in dias:
         try:
-            filas[d] = bajar(d, historico=True)
+            precios = bajar(d, historico=True, solo=solo)
+            if precios:
+                filas[d] = precios
         except ValueError as e:  # 1816 no devolvió precios para ese día: se sigue con el resto
             fallidos.append(d)
             print(f"{d}: sin precios ({e})")
@@ -132,6 +145,21 @@ def main() -> int:
     if fallidos and not filas:
         raise SystemExit(f"ERROR: 1816 no devolvió precios para {', '.join(map(str, fallidos))}.")
     return 0
+
+
+def parsear_solo(texto: str | None) -> set[str] | None:
+    if not texto or not texto.strip():
+        return None
+    hojas = {"DUALES": lambda: fw.load_duales().ticker, "LETAM": lambda: fw.load_letam().ticker,
+             "LECER": lambda: fw.load_lecer().ticker, "LECAPS": lambda: fw.load_lecaps().ticker}
+    salida = set()
+    for t in texto.replace(";", ",").split(","):
+        t = t.strip().upper()
+        if t in hojas:
+            salida |= set(hojas[t]())
+        elif t:
+            salida.add(t)
+    return salida
 
 
 DIAS_AUTOCOMPLETAR = 21  # días corridos hacia atrás que revisa cada corrida programada
