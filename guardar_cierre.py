@@ -1,7 +1,10 @@
 """Guarda cierres de 1816 en precios_1816.csv.
 
-Uso normal (lo corre GitHub Actions todos los días hábiles a las 17:30):
+Uso normal (lo corre GitHub Actions los días hábiles después del cierre):
     python guardar_cierre.py
+  Pide con fecha explícita el último cierre (hoy si ya son las 17, si no el día hábil anterior)
+  y completa los días hábiles de las últimas 3 semanas que falten en el CSV. Así no importa si
+  GitHub lo corre con demora, y si un día falla se recupera en la corrida siguiente.
 
 Completar días que faltan (precios de fechas pasadas):
     python guardar_cierre.py --desde 2026-10-16
@@ -92,28 +95,63 @@ def main() -> int:
     ap.add_argument("--forzar", action="store_true", help="guardar hoy aunque no sea hábil")
     a = ap.parse_args()
 
-    hoy = datetime.now(TZ).date()
+    ahora = datetime.now(TZ)
+    hoy = ahora.date()
     feriados = fw.load_feriados()
+
+    if a.forzar:  # precio en vivo de hoy, aunque no sea hábil
+        guardar({hoy: bajar(hoy, historico=False)})
+        return 0
 
     if a.desde:
         desde = date.fromisoformat(a.desde)
-        hasta = date.fromisoformat(a.hasta) if a.hasta else hoy - timedelta(days=1)
-        dias = [desde + timedelta(days=i) for i in range((hasta - desde).days + 1)]
-        dias = [d for d in dias if fw.es_habil(d, feriados)]
-        print(f"Completando {len(dias)} días hábiles: {dias[0]} a {dias[-1]}" if dias
-              else "No hay días hábiles en ese rango.")
-        filas = {}
-        for d in dias:
-            filas[d] = bajar(d, historico=True)
-        if filas:
-            guardar(filas)
-        return 0
+        hasta = date.fromisoformat(a.hasta) if a.hasta else ultimo_cierre(ahora, feriados)
+        dias = habiles_entre(desde, hasta, feriados)
+    else:
+        # Corrida programada. GitHub a veces la ejecuta con horas de demora (incluso pasada la
+        # medianoche), así que no se pide "el precio de ahora": se pide con fecha explícita el
+        # último cierre, y de paso se completan los días hábiles recientes que falten en el CSV.
+        objetivo = ultimo_cierre(ahora, feriados)
+        guardadas = set(leer_csv().index)
+        recientes = habiles_entre(objetivo - timedelta(days=DIAS_AUTOCOMPLETAR), objetivo, feriados)
+        dias = [d for d in recientes if d not in guardadas or d == objetivo]
 
-    if not a.forzar and not fw.es_habil(hoy, feriados):
-        print(f"{hoy}: no es día hábil, no se guarda nada.")
+    if not dias:
+        print("No hay días hábiles para guardar.")
         return 0
-    guardar({hoy: bajar(hoy, historico=False)})
+    print(f"Días a guardar ({len(dias)}): {', '.join(str(d) for d in dias)}")
+    filas, fallidos = {}, []
+    for d in dias:
+        try:
+            filas[d] = bajar(d, historico=True)
+        except ValueError as e:  # 1816 no devolvió precios para ese día: se sigue con el resto
+            fallidos.append(d)
+            print(f"{d}: sin precios ({e})")
+    if filas:
+        guardar(filas)
+    if fallidos and not filas:
+        raise SystemExit(f"ERROR: 1816 no devolvió precios para {', '.join(map(str, fallidos))}.")
     return 0
+
+
+DIAS_AUTOCOMPLETAR = 21  # días corridos hacia atrás que revisa cada corrida programada
+HORA_CIERRE = 17         # desde esta hora se toma el cierre del mismo día
+
+
+def habiles_entre(desde: date, hasta: date, feriados: set[date]) -> list[date]:
+    dias = [desde + timedelta(days=i) for i in range((hasta - desde).days + 1)]
+    return [d for d in dias if fw.es_habil(d, feriados)]
+
+
+def ultimo_cierre(ahora: datetime, feriados: set[date]) -> date:
+    """Hoy si es hábil y ya cerró el mercado; si no, el último día hábil anterior."""
+    d = ahora.date()
+    if fw.es_habil(d, feriados) and ahora.hour >= HORA_CIERRE:
+        return d
+    d -= timedelta(days=1)
+    while not fw.es_habil(d, feriados):
+        d -= timedelta(days=1)
+    return d
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@ name: Cierre diario 1816
 
 on:
   schedule:
-    - cron: "30 20 * * 1-5"
+    - cron: "47 20 * * 1-5"   # 17:47 Argentina. GitHub puede demorarlo; el script lo tolera
   workflow_dispatch:
     inputs:
       desde:
@@ -20,6 +20,10 @@ on:
 
 permissions:
   contents: write
+
+concurrency:
+  group: cierre-diario
+  cancel-in-progress: false
 
 jobs:
   guardar:
@@ -54,4 +58,5 @@ jobs:
           git add precios_1816.csv || exit 0
           git diff --cached --quiet && echo "Sin cambios" && exit 0
           git commit -m "Cierres 1816 $(TZ=America/Argentina/Buenos_Aires date +%Y-%m-%d)"
+          git pull --rebase
           git push
