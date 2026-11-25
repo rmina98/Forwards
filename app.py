@@ -310,20 +310,24 @@ def vista_tabla_letam(proy_hoy: float):
     with st.expander("Detalle por Letam"):
         r = fw.resumen(px, bonos, liq).merge(
             bonos[["ticker", "margen", "tamar_prom", "conocido"]], on="ticker")
-        r["spread"] = r.TNA - proy
+        # Spread como en tu planilla: TIR.NO.PER (TEA, base 365) llevada a TNA de capitalización
+        # mensual, menos la TAMAR proyectada: 12·((1+TIR)^(1/12) − 1) − TAMAR
+        r["spread"] = ((1 + r.TEA) ** (1 / 12) - 1) * 12 - proy
         r = r[["ticker", "vencimiento", "dias", "precio", "margen", "tamar_prom", "conocido", "vf",
                "TEM", "TNA", "TEA", "spread"]]
         r.columns = ["Ticker", "Vencimiento", "Días", "Precio", "Margen", "TAMAR prom. ventana",
-                     "% ventana publicada", "Pago final est.", "TEM", "TNA", "TEA", "TNA − TAMAR proy."]
+                     "% ventana publicada", "Pago final est.", "TEM", "TNA", "TEA", "Spread vs TAMAR"]
         st.dataframe(r.style.format({"Precio": "{:.3f}", "Margen": "{:.2%}", "TAMAR prom. ventana": "{:.2%}",
                                      "% ventana publicada": "{:.0%}", "Pago final est.": "{:.3f}",
                                      "TEM": "{:.2%}", "TNA": "{:.2%}", "TEA": "{:.2%}",
-                                     "TNA − TAMAR proy.": "{:+.2%}"}),
+                                     "Spread vs TAMAR": "{:+.2%}"}),
                      use_container_width=True, hide_index=True)
         st.caption("Pago final = 100 × (1 + TEM)^(meses 30/360 desde la emisión), con "
                    "TEM = [(1 + (TAMAR prom. + margen) × 32/365)^(365/32)]^(1/12) − 1. La TAMAR promedio "
                    "es la de la ventana [emisión − 10 hábiles, vencimiento − 10 hábiles]: lo publicado "
-                   "sale de la hoja Tamar y lo que falta, de la TAMAR proyectada.")
+                   "sale de la hoja Tamar y lo que falta, de la TAMAR proyectada. "
+                   "Spread vs TAMAR = 12 × ((1 + TEA)^(1/12) − 1) − TAMAR proyectada, con TEA = "
+                   "TIR.NO.PER (base 365).")
 
 
 def vista_historica_letam(proy_hoy: float):
