@@ -9,7 +9,7 @@ Completar días que faltan (precios de fechas pasadas):
 
 En GitHub: pestaña Actions → "Cierre diario 1816" → Run workflow, completando "desde".
 
-Toma las especies del Excel (Lecaps, LECER y Flujo HD con sus D y C) y agrega (o reemplaza)
+Toma las especies del Excel (Lecaps, LECER, Letam y Flujo HD con sus D y C) y agrega (o reemplaza)
 una fila por día en precios_1816.csv, con el mismo formato que la hoja Precios.
 Para fechas pasadas verifica que 1816 devuelva precios de ESA fecha; si devuelve otra
 (o sea, si la API no deja pedir históricos), se frena sin guardar nada.
@@ -37,8 +37,11 @@ def tickers_vivos(dia: date) -> list[str]:
     lecaps = fw.load_lecaps()
     lecer = fw.load_lecer()
     hd = fw.bonos_hd(fw.load_flujos_hd())
+    letam = fw.load_letam()
+    letam = letam[(letam.vencimiento >= dia) & (letam.emision <= dia)]  # ya emitidas y vivas
     vivos = (lecaps[lecaps.vencimiento >= dia].ticker.tolist()
-             + lecer[lecer.vencimiento >= dia].ticker.tolist())
+             + lecer[lecer.vencimiento >= dia].ticker.tolist()
+             + letam.ticker.tolist())
     hd_vivos = hd[hd.vencimiento >= dia].ticker.tolist()
     return vivos + [t + s for t in hd_vivos for s in ("D", "C")]
 

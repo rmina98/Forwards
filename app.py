@@ -24,10 +24,11 @@ def base(mtime_excel: float, mtime_cierres: float):
     lecer = fw.load_lecer()
     flujos = fw.load_flujos_hd()
     hd = fw.bonos_hd(flujos)
-    tickers = (lecaps.ticker.tolist() + lecer.ticker.tolist()
+    letam = fw.load_letam()
+    tickers = (lecaps.ticker.tolist() + lecer.ticker.tolist() + letam.ticker.tolist()
                + [t + s for t in hd.ticker for s in ("D", "C")])
     return (lecaps, lecer, flujos, hd, fw.load_cer(), fw.load_feriados(),
-            fw.load_precios(tickers))
+            fw.load_precios(tickers), letam, fw.load_tamar())
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -52,15 +53,17 @@ def _mtime_cierres() -> float:
 
 
 try:
-    lecaps, lecer, flujos, hd, cer, feriados, hist = base(fw.ruta_inputs().stat().st_mtime, _mtime_cierres())
+    (lecaps, lecer, flujos, hd, cer, feriados, hist, letam,
+     tamar) = base(fw.ruta_inputs().stat().st_mtime, _mtime_cierres())
 except FileNotFoundError as e:
     st.error(str(e))
     st.stop()
 hoy = datetime.now(TZ).date()
 hd_d = [t + "D" for t in hd.ticker]
 hd_c = [t + "C" for t in hd.ticker]
-todos = lecaps.ticker.tolist() + lecer.ticker.tolist() + hd_d + hd_c
+todos = lecaps.ticker.tolist() + lecer.ticker.tolist() + letam.ticker.tolist() + hd_d + hd_c
 tipo_de = {**{t: "Lecap" for t in lecaps.ticker}, **{t: "CER" for t in lecer.ticker},
+           **{t: "Letam" for t in letam.ticker},
            **{t: "HD MEP" for t in hd_d}, **{t: "HD Cable" for t in hd_c}}
 venc_hd = hd.set_index("ticker").vencimiento
 
@@ -88,7 +91,8 @@ with st.sidebar:
         n_lec = live.reindex(lecaps.ticker).notna().sum()
         n_cer = live.reindex(lecer.ticker).notna().sum()
         n_hd = live.reindex(hd_d + hd_c).notna().sum()
-        st.success(f"1816 conectado: {n_lec} Lecaps, {n_cer} CER y {n_hd} precios HD (D/C), "
+        n_ltm = live.reindex(letam.ticker).notna().sum()
+        st.success(f"1816 conectado: {n_lec} Lecaps, {n_cer} CER, {n_ltm} Letam y {n_hd} precios HD (D/C), "
                    f"consulta de las {ts_api:%H:%M:%S}")
         ahora = datetime.now(TZ)
         if not (fw.es_habil(hoy, feriados) and (10, 30) <= (ahora.hour, ahora.minute) < (17, 0)):
@@ -115,6 +119,7 @@ if live is not None:
     st.session_state.setdefault("reset_editor", 0)
     with st.expander("✏️ Precios de hoy (editables)", expanded=False):
         venc = pd.concat([lecaps.set_index("ticker").vencimiento, lecer.set_index("ticker").vencimiento,
+                          letam.set_index("ticker").vencimiento,
                           venc_hd.rename(lambda t: t + "D"), venc_hd.rename(lambda t: t + "C")])
         base_px = pd.DataFrame({
             "Tipo": [tipo_de[t] for t in todos],
@@ -259,6 +264,93 @@ def vista_historica(clave: str, bonos: pd.DataFrame, es_cer: bool):
 
     st.download_button("Descargar serie (CSV)", s.to_csv().encode(),
                        f"forward_{corto}_{largo}.csv", "text/csv", key=f"dl_{clave}")
+
+
+# ---------------------------------------------------------------- Letam (TAMAR)
+def input_tamar() -> float:
+    """TAMAR proyectada para la parte de la ventana que todavía no se publicó (TNA)."""
+    ult_f, ult = tamar.index[-1], float(tamar.iloc[-1])
+    c1, c2 = st.columns([1, 3])
+    v = c1.number_input("TAMAR proyectada (TNA %)", min_value=0.0, max_value=200.0,
+                        value=round(ult * 100, 4), step=0.25, format="%.4f", key="tamar_proy")
+    c2.markdown(f"Última TAMAR publicada en la hoja Tamar: **{ult:.4%}** ({ult_f:%d-%m-%Y}). "
+                "La parte de la ventana que todavía no se publicó se completa con la TAMAR proyectada. "
+                "Por defecto es la última publicada, o sea TAMAR constante.")
+    return v / 100
+
+
+def vista_tabla_letam(proy_hoy: float):
+    c1, c2 = st.columns([1, 3])
+    opciones = [fecha_px] + [d for d in reversed(hist.index) if d != fecha_px]
+    fecha_sel = c1.selectbox("Fecha", opciones, key="fecha_ltm",
+                             format_func=lambda d: f"{d:%d-%m-%Y}" + (" (hoy)" if d == fecha_px else ""))
+    px = precios_hoy if fecha_sel == fecha_px else hist.loc[fecha_sel]
+    liq = fw.sumar_habiles(fecha_sel, plazo, feriados) if plazo else fecha_sel
+    proy = proy_hoy if fecha_sel == fecha_px else fw.tamar_al(fecha_sel, tamar)
+    bonos = fw.letam_a_fecha(letam, fecha_sel, tamar, proy, feriados)
+    c2.markdown(f"**Precios:** {fuente if fecha_sel == fecha_px else 'cierre histórico'} · "
+                f"**Liquidación:** {liq:%d-%m-%Y} · **TAMAR proyectada:** {proy:.2%}"
+                + ("" if fecha_sel == fecha_px else " (la publicada ese día)"))
+
+    faltan = [t for t in bonos.ticker if pd.isna(px.get(t))
+              and bonos.set_index("ticker").vencimiento[t] > liq
+              and bonos.set_index("ticker").emision[t] <= fecha_sel]
+    if fecha_sel == fecha_px and faltan:
+        st.caption(f"⚠️ Sin precio para: {', '.join(faltan)}")
+
+    m = fw.tabla_forward(px, bonos, liq, tipo)
+    if m.empty:
+        st.info("No hay Letam con precio en esa fecha.")
+        return
+    m.index.name = f"{fecha_sel:%d-%b}"
+    st.caption("Diagonal: TIR de cada Letam con la TAMAR proyectada. Fila i, columna j: tasa forward "
+               "implícita entre el vencimiento de i y el de j.")
+    st.dataframe(estilo_matriz(m), use_container_width=True, height=36 * (len(m) + 1) + 3)
+
+    with st.expander("Detalle por Letam"):
+        r = fw.resumen(px, bonos, liq).merge(
+            bonos[["ticker", "margen", "tamar_prom", "conocido"]], on="ticker")
+        r["spread"] = r.TNA - proy
+        r = r[["ticker", "vencimiento", "dias", "precio", "margen", "tamar_prom", "conocido", "vf",
+               "TEM", "TNA", "TEA", "spread"]]
+        r.columns = ["Ticker", "Vencimiento", "Días", "Precio", "Margen", "TAMAR prom. ventana",
+                     "% ventana publicada", "Pago final est.", "TEM", "TNA", "TEA", "TNA − TAMAR proy."]
+        st.dataframe(r.style.format({"Precio": "{:.3f}", "Margen": "{:.2%}", "TAMAR prom. ventana": "{:.2%}",
+                                     "% ventana publicada": "{:.0%}", "Pago final est.": "{:.3f}",
+                                     "TEM": "{:.2%}", "TNA": "{:.2%}", "TEA": "{:.2%}",
+                                     "TNA − TAMAR proy.": "{:+.2%}"}),
+                     use_container_width=True, hide_index=True)
+        st.caption("Pago final = 100 × (1 + TEM)^(meses 30/360 desde la emisión), con "
+                   "TEM = [(1 + (TAMAR prom. + margen) × 32/365)^(365/32)]^(1/12) − 1. La TAMAR promedio "
+                   "es la de la ventana [emisión − 10 hábiles, vencimiento − 10 hábiles]: lo publicado "
+                   "sale de la hoja Tamar y lo que falta, de la TAMAR proyectada.")
+
+
+def vista_historica_letam(proy_hoy: float):
+    vivas = letam[letam.vencimiento > hoy].ticker.tolist()
+    if len(vivas) < 2:
+        st.info("Hacen falta al menos dos Letam vivas.")
+        return
+    c1, c2, c3 = st.columns(3)
+    a = c1.selectbox("Letam corta", vivas, index=0, key="a_ltm")
+    resto = [t for t in vivas if t != a]
+    b = c2.selectbox("Letam larga", resto, index=len(resto) - 1, key="b_ltm")
+    ver_tir = c3.checkbox("Mostrar TIR de cada una", value=True, key="tir_ltm")
+
+    s = fw.forward_historica_letam(hist_full, letam, a, b, tamar, feriados, plazo, tipo,
+                                   proyectada_hoy=proy_hoy if live is not None else None, hoy=hoy)
+    if s.empty:
+        st.info("No hay precios en común para ese par.")
+        return
+    corto, largo = [c.replace("TIR ", "") for c in s.columns[:2]]
+    nombre_fwd = f"Forward {corto} → {largo}"
+    kpis(s["Forward"])
+    s_graf = s.rename(columns={"Forward": nombre_fwd})[[nombre_fwd, f"TIR {corto}", f"TIR {largo}"]]
+    grafico_serie(s_graf if ver_tir else s_graf[[nombre_fwd]], tipo)
+    st.caption("Cada día se proyecta la TAMAR futura igual a la última publicada ese día "
+               "(hoy, la TAMAR proyectada de arriba).")
+    st.download_button("Descargar serie (CSV)", s.to_csv().encode(),
+                       f"forward_{corto}_{largo}.csv", "text/csv", key="dl_ltm")
 
 
 # ---------------------------------------------------------------- hard dollar
@@ -535,8 +627,9 @@ elif seccion == "Canje MEP/Cable":
     vista_canje()
 
 else:  # Forwards
-    tab_lec, tab_cer, tab_mep, tab_ccl = st.tabs(
-        ["Lecaps (tasa fija)", "CER (tasa real)", "Hard dollar · MEP", "Hard dollar · Cable"])
+    tab_lec, tab_cer, tab_ltm, tab_mep, tab_ccl = st.tabs(
+        ["Lecaps (tasa fija)", "CER (tasa real)", "Letam (TAMAR)", "Hard dollar · MEP",
+         "Hard dollar · Cable"])
 
     with tab_lec:
         t1, t2 = st.tabs(["Tabla de forwards", "Forward histórica"])
@@ -551,6 +644,14 @@ else:  # Forwards
             vista_tabla("cer", lecer, es_cer=True)
         with t2:
             vista_historica("cer", lecer, es_cer=True)
+
+    with tab_ltm:
+        proy = input_tamar()
+        t1, t2 = st.tabs(["Tabla de forwards", "Forward histórica"])
+        with t1:
+            vista_tabla_letam(proy)
+        with t2:
+            vista_historica_letam(proy)
 
     with tab_mep:
         t1, t2 = st.tabs(["Tabla de forwards", "Forward histórica"])

@@ -516,3 +516,116 @@ def puntos_hd(precios: pd.Series, flujos: pd.DataFrame, liquidacion: date, sufij
     f = flujos if tickers is None else flujos[flujos.ticker.isin(tickers)]
     m = metricas_hd(precios, f, liquidacion, sufijo).dropna(subset=["TIR", "duration"])
     return m[["ticker", "vencimiento", "duration", "TIR", "precio"]].reset_index(drop=True)
+
+
+# ================================================================ LETAM (TAMAR + margen)
+def load_letam() -> pd.DataFrame:
+    """Hoja 'Letam': Ticker | Emisión | Vencimiento | Tasa (margen sobre TAMAR, TNA)."""
+    raw = _hoja("Letam")
+    df = raw.iloc[:, :4].copy()
+    df.columns = ["ticker", "emision", "vencimiento", "margen"]
+    df = df.dropna(subset=["ticker", "emision", "vencimiento"])
+    df["ticker"] = df["ticker"].astype(str).str.strip().str.upper()
+    df = df.drop_duplicates("ticker")
+    df["emision"] = pd.to_datetime(df["emision"]).dt.date
+    df["vencimiento"] = pd.to_datetime(df["vencimiento"]).dt.date
+    df["margen"] = pd.to_numeric(df["margen"], errors="coerce").fillna(0.0)
+    return df.sort_values("vencimiento").reset_index(drop=True)
+
+
+def load_tamar() -> pd.Series:
+    """Hoja 'Tamar': Fecha | TAMAR en % TNA (24,125). Devuelve decimales (0,24125)."""
+    df = _hoja("Tamar").iloc[:, :2]
+    df.columns = ["fecha", "tamar"]
+    df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+    df["tamar"] = pd.to_numeric(df["tamar"], errors="coerce")
+    df = df.dropna()
+    df = df[df["tamar"] > 0].sort_values("fecha")
+    s = pd.Series(df["tamar"].to_numpy(), index=df["fecha"].dt.date)
+    s = s[~s.index.duplicated(keep="last")]
+    return s / 100 if s.median() > 1 else s
+
+
+def tamar_al(fecha: date, tamar: pd.Series) -> float:
+    """Última TAMAR publicada hasta esa fecha (inclusive)."""
+    d = tamar.loc[:fecha]
+    return float(d.iloc[-1]) if not d.empty else float("nan")
+
+
+def tem_tamar(tna: float) -> float:
+    """TNA (TAMAR promedio + margen) → TEM capitalizable: [(1 + TNA·32/365)^(365/32)]^(1/12) − 1."""
+    return (1 + tna * 32 / 365) ** (365 / 32 / 12) - 1
+
+
+def tamar_promedio(emision: date, vencimiento: date, fecha_op: date, tamar: pd.Series,
+                   proyectada: float, feriados: set[date], rezago: int = 10) -> tuple[float, float]:
+    """Promedio simple de la TAMAR en la ventana [emisión − 10 hábiles, cobro − 10 hábiles].
+
+    Los días con TAMAR publicada hasta fecha_op usan el dato real; los que faltan, la proyectada.
+    Devuelve (promedio, fracción de la ventana ya conocida).
+    """
+    ini = restar_habiles(proximo_habil(emision, feriados), rezago, feriados)
+    fin = restar_habiles(proximo_habil(vencimiento, feriados), rezago, feriados)
+    corte = min(fecha_op, tamar.index[-1]) if len(tamar) else fecha_op
+    conocidos = tamar.loc[ini:min(fin, corte)]
+    n_fut = 0
+    d = max(ini, corte + timedelta(days=1))
+    while d <= fin:
+        if es_habil(d, feriados):
+            n_fut += 1
+        d += timedelta(days=1)
+    n = len(conocidos) + n_fut
+    if n == 0:
+        return proyectada, 0.0
+    return (float(conocidos.sum()) + proyectada * n_fut) / n, len(conocidos) / n
+
+
+def valor_final_letam(emision: date, vencimiento: date, margen: float, tamar_prom: float) -> float:
+    """Pago al vencimiento cada 100 VN: capitaliza la TEM de (TAMAR promedio + margen)
+    por meses 30/360 desde la emisión, igual que las Lecaps."""
+    return 100 * (1 + tem_tamar(tamar_prom + margen)) ** (dias360(emision, vencimiento) / 30)
+
+
+def letam_a_fecha(letam: pd.DataFrame, fecha_op: date, tamar: pd.Series, proyectada: float,
+                  feriados: set[date]) -> pd.DataFrame:
+    """Copia de la hoja Letam con 'vf' (pago final estimado en esa fecha) y la TAMAR usada."""
+    df = letam.copy()
+    proms = [tamar_promedio(e, v, fecha_op, tamar, proyectada, feriados)
+             for e, v in zip(df.emision, df.vencimiento)]
+    df["tamar_prom"] = [p for p, _ in proms]
+    df["conocido"] = [c for _, c in proms]
+    df["vf"] = [valor_final_letam(e, v, m, p)
+                for e, v, m, p in zip(df.emision, df.vencimiento, df.margen, df.tamar_prom)]
+    return df
+
+
+def forward_historica_letam(hist: pd.DataFrame, letam: pd.DataFrame, corto: str, largo: str,
+                            tamar: pd.Series, feriados: set[date], plazo_liq: int = 1,
+                            tipo: str = "TEM", proyectada_hoy: float | None = None,
+                            hoy: date | None = None) -> pd.DataFrame:
+    """Serie diaria de la forward entre dos Letam. Cada día proyecta la TAMAR futura igual a la
+    última publicada ese día (para hoy, proyectada_hoy si se pasa)."""
+    a = letam.set_index("ticker").loc[corto]
+    b = letam.set_index("ticker").loc[largo]
+    if b.vencimiento <= a.vencimiento:
+        a, b = b, a
+        corto, largo = largo, corto
+    df = hist.reindex(columns=[corto, largo]).dropna()
+    filas = []
+    for f, row in df.iterrows():
+        liq = sumar_habiles(f, plazo_liq, feriados)
+        da, db = (a.vencimiento - liq).days, (b.vencimiento - liq).days
+        if da <= 0:
+            continue
+        proy = proyectada_hoy if (proyectada_hoy is not None and f == hoy) else tamar_al(f, tamar)
+        pa, _ = tamar_promedio(a.emision, a.vencimiento, f, tamar, proy, feriados)
+        pb, _ = tamar_promedio(b.emision, b.vencimiento, f, tamar, proy, feriados)
+        fa = valor_final_letam(a.emision, a.vencimiento, a.margen, pa) / row[corto]
+        fb = valor_final_letam(b.emision, b.vencimiento, b.margen, pb) / row[largo]
+        filas.append({"fecha": pd.Timestamp(f),
+                      f"TIR {corto}": float(convertir(fa, da, tipo)),
+                      f"TIR {largo}": float(convertir(fb, db, tipo)),
+                      "Forward": float(convertir(fb / fa, db - da, tipo))})
+    if not filas:
+        return pd.DataFrame()
+    return pd.DataFrame(filas).set_index("fecha")

@@ -12,6 +12,8 @@ Todo sale del Excel que está junto a `app.py`:
 |---|---|
 | `Lecaps` | Ticker, Emisión, Vencimiento, Tasa (TEM). Pago final = 100·(1+TEM)^(días 30/360 / 30) |
 | `Precios` | Fecha + una columna por ticker (acepta precio cada 1 o cada 100 VN) |
+| `Letam` | Ticker, Emisión, Vencimiento, Tasa (margen sobre TAMAR). Pago = 100·(1+TEM)^(meses 30/360), TEM = [(1+(TAMAR prom.+margen)·32/365)^(365/32)]^(1/12)−1 |
+| `Tamar` | Fecha, TAMAR (% TNA). Ventana del promedio: emisión −10 hábiles a vencimiento −10 hábiles; lo no publicado se proyecta |
 | `LECER` | Ticker, Emisión, Vencimiento, Tasa, CER inicial. Pago = 100·(1+Tasa)·CER ref / CER inicial |
 | `CER` | Fecha, CER (se descarta la cola constante de proyección) |
 | `Flujo HD` | Ticker, Fecha de pago, Amortización, Valor residual, Tasa, Interés (vn). Montos como fracción del VN original |
