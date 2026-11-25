@@ -515,6 +515,11 @@ def puntos_curva(curva: str, fecha, sel_hd: list[str]) -> pd.DataFrame:
         fijos = fw.cer_ya_fijo(lecer, fecha, cer, feriados)
         vivas = lecer[~lecer.ticker.isin(fijos)]
         p = fw.puntos_cero_cupon(px, fw.lecer_a_fecha(vivas, coef_cer(liq)), liq)
+    elif curva == "TAMAR":
+        # Hoy: la TAMAR proyectada de la solapa Letam (si se tocó); otra fecha: la publicada ese día
+        proy = (st.session_state["tamar_proy"] / 100
+                if fecha == fecha_px and "tamar_proy" in st.session_state else fw.tamar_al(fecha, tamar))
+        p = fw.puntos_cero_cupon(px, fw.letam_a_fecha(letam, fecha, tamar, proy, feriados), liq)
     else:
         p = fw.puntos_hd(px, flujos, liq, "D" if curva == "HD MEP" else "C", sel_hd)
     p = p.dropna(subset=["TIR", "duration"]).copy()
@@ -529,7 +534,7 @@ def fecha_anterior(objetivo):
 
 def vista_curvas():
     c1, c2 = st.columns([3, 1])
-    curva = c1.radio("Curva", ["Tasa fija", "CER", "HD MEP", "HD Cable"], horizontal=True,
+    curva = c1.radio("Curva", ["Tasa fija", "CER", "TAMAR", "HD MEP", "HD Cable"], horizontal=True,
                      key="curva_tipo")
     modelo = c2.selectbox("Ajuste", ["Nelson-Siegel", "Logarítmica"], key="curva_modelo")
     sel_hd = filtro_ley("curva") if curva.startswith("HD") else []
@@ -572,6 +577,10 @@ def vista_curvas():
             p["var"] = (p.TIR - p.TIR_c) * 1e4
 
     unidad = f"{tipo}{' real' if curva == 'CER' else ''}"
+    if curva == "TAMAR":
+        st.caption("Letam: TIR con el pago final estimado con la TAMAR proyectada (hoy, la de la solapa "
+                   "Letam; en otras fechas, la publicada ese día). Con menos de 6 especies el ajuste "
+                   "pasa a logarítmico.")
     st.caption(f"{desc}. Ajuste sobre TIR ({unidad}) contra duration en años. Spread = TIR − curva: "
                "positivo = el bono rinde más que la curva (**barato**); negativo = **rico**.")
 
