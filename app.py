@@ -287,7 +287,42 @@ def input_tamar() -> float:
     return v / 100
 
 
-def vista_tabla_letam(proy_hoy: float, en_margen: bool, base_ltm: pd.DataFrame):
+@st.cache_data(show_spinner=False)
+def rem_tamar(mtime: float):
+    return fw.load_rem_tamar()
+
+
+def editor_tamar_esperada():
+    """Curva de TAMAR esperada para el ZDM: REM (mediana) + tus valores para los meses que siguen."""
+    p = fw.archivo_rem()
+    if p is None:
+        return None
+    rem, titulo = rem_tamar(p.stat().st_mtime)
+    if rem.empty:
+        return None
+    ultimo = rem.index[-1]
+    hasta = pd.Period(f"{ultimo.year + (1 if ultimo.month == 12 else 0)}-12", "M")
+    meses_man = pd.period_range(ultimo + 1, hasta, freq="M")
+    with st.expander(f"TAMAR esperada para el ZDM: REM hasta {ultimo.strftime('%b-%y')} + tus supuestos "
+                     f"hasta {hasta.strftime('%b-%y')}"):
+        c1, c2 = st.columns([1, 2])
+        c1.markdown(f"**{titulo or p.name}** (mediana)")
+        c1.dataframe(pd.DataFrame({"Mes": [m.strftime("%b-%y") for m in rem.index],
+                                   "TAMAR REM": rem.values}).style.format({"TAMAR REM": "{:.2%}"}),
+                     hide_index=True, use_container_width=True)
+        base_man = pd.DataFrame({"Mes": [m.strftime("%b-%y") for m in meses_man],
+                                 "TAMAR (TNA %)": [round(float(rem.iloc[-1]) * 100, 2)] * len(meses_man)})
+        ed = c2.data_editor(base_man, key=f"tamar_manual_{ultimo}", hide_index=True,
+                            disabled=["Mes"], use_container_width=True,
+                            column_config={"TAMAR (TNA %)": st.column_config.NumberColumn(
+                                min_value=0.0, max_value=200.0, step=0.25, format="%.2f")})
+        c2.caption(f"Arrancan con la de {ultimo.strftime('%b-%y')}. Después de {hasta.strftime('%b-%y')} "
+                   "se mantiene tu último valor.")
+    manual = {m: (v / 100 if pd.notna(v) else None) for m, v in zip(meses_man, ed["TAMAR (TNA %)"])}
+    return fw.curva_tamar_esperada(rem, manual)
+
+
+def vista_tabla_letam(proy_hoy: float, en_margen: bool, base_ltm: pd.DataFrame, curva_rem=None):
     c1, c2 = st.columns([1, 3])
     opciones = [fecha_px] + [d for d in reversed(hist.index) if d != fecha_px]
     fecha_sel = c1.selectbox("Fecha", opciones, key="fecha_ltm",
@@ -327,15 +362,30 @@ def vista_tabla_letam(proy_hoy: float, en_margen: bool, base_ltm: pd.DataFrame):
         # Spread como en tu planilla: TIR.NO.PER (TEA, base 365) llevada a TNA de capitalización
         # mensual, menos la TAMAR proyectada: 12·((1+TIR)^(1/12) − 1) − TAMAR
         r["spread"] = ((1 + r.TEA) ** (1 / 12) - 1) * 12 - proy
+        extrap = []
+        if curva_rem is not None:
+            z = fw.zdm_tabla(px, bonos, fecha_sel, tamar, curva_rem, feriados, plazo)
+            if not z.empty:
+                r = r.merge(z[["ticker", "zdm", "extrapolado"]], on="ticker", how="left")
+                extrap = r.loc[r.extrapolado.fillna(False).astype(bool), "ticker"].tolist()
+        if "zdm" not in r:
+            r["zdm"] = np.nan
         r = r[["ticker", "vencimiento", "dias", "precio", "margen", "tamar_prom", "conocido", "vf",
-               "TEM", "TNA", "TEA", "spread"]]
+               "TEM", "TNA", "TEA", "spread", "zdm"]]
         r.columns = ["Ticker", "Vencimiento", "Días", "Precio", "Margen", "TAMAR prom. ventana",
-                     "% ventana publicada", "Pago final est.", "TEM", "TNA", "TEA", "Spread vs TAMAR"]
+                     "% ventana publicada", "Pago final est.", "TEM", "TNA", "TEA", "Spread vs TAMAR",
+                     "ZDM (REM)"]
+        r["Ticker"] = [t + (" *" if t in extrap else "") for t in r["Ticker"]]
         st.dataframe(r.style.format({"Precio": "{:.3f}", "Margen": "{:.2%}", "TAMAR prom. ventana": "{:.2%}",
                                      "% ventana publicada": "{:.0%}", "Pago final est.": "{:.3f}",
                                      "TEM": "{:.2%}", "TNA": "{:.2%}", "TEA": "{:.2%}",
-                                     "Spread vs TAMAR": "{:+.2%}"}),
+                                     "Spread vs TAMAR": "{:+.2%}", "ZDM (REM)": "{:+.2%}"}, na_rep=""),
                      use_container_width=True, hide_index=True)
+        st.caption("ZDM (REM) = Z tal que precio = pago proyectado / Π (1 + (TAMAR esperada del mes + Z)/12)"
+                   "^(días·12/365); el pago también se proyecta con esa curva. Con TAMAR constante coincide "
+                   "con el Spread vs TAMAR."
+                   + (f" * {', '.join(extrap)}: vencen después del último mes de la curva, se usa tu último "
+                      "valor plano." if extrap else ""))
         st.caption("Pago final = 100 × (1 + TEM)^(meses 30/360 desde la emisión), con "
                    "TEM = [(1 + (TAMAR prom. + margen) × 32/365)^(365/32)]^(1/12) − 1. La TAMAR promedio "
                    "es la de la ventana [emisión − 10 hábiles, vencimiento − 10 hábiles]: lo publicado "
@@ -797,6 +847,7 @@ else:  # Forwards
 
     with tab_ltm:
         proy = input_tamar()
+        curva_rem = editor_tamar_esperada()
         en_margen = st.radio("Mostrar", ["Tasa directa", "Margen sobre TAMAR"], horizontal=True,
                              key="ltm_vista") == "Margen sobre TAMAR"
         incl = (not duales.empty) and st.checkbox(
@@ -807,7 +858,7 @@ else:  # Forwards
         base_ltm = pd.concat([letam, duales_tamar], ignore_index=True) if incl else letam
         t1, t2 = st.tabs(["Tabla de forwards", "Forward histórica"])
         with t1:
-            vista_tabla_letam(proy, en_margen, base_ltm)
+            vista_tabla_letam(proy, en_margen, base_ltm, curva_rem)
         with t2:
             vista_historica_letam(proy, en_margen, base_ltm)
 

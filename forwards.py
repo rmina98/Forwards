@@ -558,26 +558,29 @@ def tem_tamar(tna: float) -> float:
 
 
 def tamar_promedio(emision: date, vencimiento: date, fecha_op: date, tamar: pd.Series,
-                   proyectada: float, feriados: set[date], rezago: int = 10) -> tuple[float, float]:
+                   proyectada, feriados: set[date], rezago: int = 10) -> tuple[float, float]:
     """Promedio simple de la TAMAR en la ventana [emisión − 10 hábiles, cobro − 10 hábiles].
 
-    Los días con TAMAR publicada hasta fecha_op usan el dato real; los que faltan, la proyectada.
+    Los días con TAMAR publicada hasta fecha_op usan el dato real; los que faltan, la proyectada:
+    un número (TAMAR constante) o una función fecha → TAMAR (curva esperada, p. ej. el REM).
     Devuelve (promedio, fracción de la ventana ya conocida).
     """
     ini = restar_habiles(proximo_habil(emision, feriados), rezago, feriados)
     fin = restar_habiles(proximo_habil(vencimiento, feriados), rezago, feriados)
     corte = min(fecha_op, tamar.index[-1]) if len(tamar) else fecha_op
     conocidos = tamar.loc[ini:min(fin, corte)]
-    n_fut = 0
+    curva = proyectada if callable(proyectada) else None
+    n_fut, suma_fut = 0, 0.0
     d = max(ini, corte + timedelta(days=1))
     while d <= fin:
         if es_habil(d, feriados):
             n_fut += 1
+            suma_fut += curva(d) if curva else proyectada
         d += timedelta(days=1)
     n = len(conocidos) + n_fut
     if n == 0:
-        return proyectada, 0.0
-    return (float(conocidos.sum()) + proyectada * n_fut) / n, len(conocidos) / n
+        return (curva(fin) if curva else proyectada), 0.0
+    return (float(conocidos.sum()) + suma_fut) / n, len(conocidos) / n
 
 
 def valor_final_letam(emision: date, vencimiento: date, margen: float, tamar_prom: float) -> float:
@@ -737,4 +740,115 @@ def opcion_duales_historica(hist: pd.DataFrame, lecer: pd.DataFrame, duales: pd.
         for _, r in t.iterrows():
             filas.append({"fecha": pd.Timestamp(f), "ticker": r.ticker, "opcion_pct": r.opcion_pct,
                           "opcion": r.opcion, "resigna_pb": r.resigna_pb, "extrapolado": r.extrapolado})
+    return pd.DataFrame(filas)
+
+
+
+# ================================================================ REM y ZDM de las Letam
+PATRON_REM = "relevamiento-expectativas-mercado-tablas-*.xlsx"
+
+
+def archivo_rem() -> Path | None:
+    """El REM más nuevo del repo (por nombre: ...-AAAA-MM.xlsx)."""
+    archivos = sorted(CARPETA.glob(PATRON_REM))
+    return archivos[-1] if archivos else None
+
+
+def load_rem_tamar(path: Path | None = None) -> tuple[pd.Series, str]:
+    """Mediana de la TAMAR esperada por mes del REM (bloque 'Tasa de interés (TAMAR)' de la hoja
+    'Cuadros de resultados'). Solo las filas mensuales; devuelve (Series Period[M] → TNA decimal, mes del REM)."""
+    path = path or archivo_rem()
+    if path is None:
+        return pd.Series(dtype=float), ""
+    import openpyxl
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # imágenes WMF del archivo del BCRA
+        wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    ws = next(w for w in wb.worksheets if "cuadro" in w.title.lower())
+    filas = list(ws.iter_rows(values_only=True))
+    wb.close()
+    titulo = next((str(c) for r in filas[:4] for c in r if isinstance(c, str) and "REM" in c), "")
+    i0 = next(i for i, r in enumerate(filas) if any(isinstance(c, str) and "TAMAR" in c for c in r))
+    enc = filas[i0 + 1]
+    col_per = next(j for j, c in enumerate(enc) if isinstance(c, str) and c.strip().lower() == "período")
+    col_med = next(j for j, c in enumerate(enc) if isinstance(c, str) and c.strip().lower() == "mediana")
+    datos = {}
+    for r in filas[i0 + 2:]:
+        per = r[col_per]
+        if per is None or (isinstance(per, str) and not per.strip()):
+            break
+        if hasattr(per, "year") and isinstance(r[col_med], (int, float)):  # solo filas mensuales
+            datos[pd.Period(per, "M")] = float(r[col_med]) / 100
+    return pd.Series(datos).sort_index(), titulo
+
+
+def curva_tamar_esperada(rem: pd.Series, manual: dict | None = None):
+    """Función fecha → TAMAR esperada (TNA). Por mes: el valor manual si lo hay, si no el del REM;
+    para meses posteriores se mantiene el último valor definido; antes del primero, el primero."""
+    meses = dict(rem.items())
+    if manual:
+        meses.update({pd.Period(k, "M"): v for k, v in manual.items() if v is not None and not pd.isna(v)})
+    serie = pd.Series(meses).sort_index()
+    claves = list(serie.index)
+    valores = serie.to_numpy()
+
+    def f(d) -> float:
+        p = pd.Period(d, "M")
+        if p <= claves[0]:
+            return float(valores[0])
+        i = np.searchsorted(np.array([k.ordinal for k in claves]), p.ordinal, side="right") - 1
+        return float(valores[i])
+    f.ultimo_mes = claves[-1]
+    return f
+
+
+def _segmentos_mensuales(desde: date, hasta: date) -> list[tuple[date, int]]:
+    """Tramos [desde, hasta) cortados por fin de mes: (fecha de referencia del tramo, días)."""
+    tramos, d = [], desde
+    while d < hasta:
+        fin_mes = (pd.Timestamp(d) + pd.offsets.MonthBegin(1)).date()
+        corte = min(fin_mes, hasta)
+        tramos.append((d, (corte - d).days))
+        d = corte
+    return tramos
+
+
+def zdm_letam(precio: float, vf: float, liq: date, vencimiento: date, curva) -> float:
+    """Zero discount margin: Z tal que precio = vf / Π (1 + (TAMAR esperada del mes + Z)/12)^(días·12/365).
+    Con TAMAR constante coincide con 12·((1+TEA)^(1/12) − 1) − TAMAR."""
+    if not (precio > 0) or vencimiento <= liq:
+        return float("nan")
+    tramos = [(curva(d), dias) for d, dias in _segmentos_mensuales(liq, vencimiento)]
+    objetivo = np.log(vf / precio)
+
+    def log_desc(z):
+        return sum(dias * 12 / 365 * np.log1p((t + z) / 12) for t, dias in tramos)
+
+    lo, hi = -0.9, 3.0
+    if (log_desc(lo) - objetivo) * (log_desc(hi) - objetivo) > 0:
+        return float("nan")
+    for _ in range(100):
+        mid = (lo + hi) / 2
+        if (log_desc(mid) - objetivo) * (log_desc(lo) - objetivo) <= 0:
+            hi = mid
+        else:
+            lo = mid
+    return (lo + hi) / 2
+
+
+def zdm_tabla(precios: pd.Series, letam: pd.DataFrame, fecha_op: date, tamar: pd.Series,
+              curva, feriados: set[date], plazo_liq: int = 1) -> pd.DataFrame:
+    """ZDM de cada Letam con la curva de TAMAR esperada (pago proyectado con la misma curva)."""
+    liq = sumar_habiles(fecha_op, plazo_liq, feriados) if plazo_liq else fecha_op
+    filas = []
+    for _, b in letam.iterrows():
+        p = precios.get(b.ticker, np.nan)
+        if pd.isna(p) or b.vencimiento <= liq or b.emision > fecha_op:
+            continue
+        prom, _ = tamar_promedio(b.emision, b.vencimiento, fecha_op, tamar, curva, feriados)
+        vf = valor_final_letam(b.emision, b.vencimiento, b.margen, prom)
+        filas.append({"ticker": b.ticker, "tamar_prom_esp": prom, "vf_esp": vf,
+                      "zdm": zdm_letam(p, vf, liq, b.vencimiento, curva),
+                      "extrapolado": pd.Period(b.vencimiento, "M") > curva.ultimo_mes})
     return pd.DataFrame(filas)
