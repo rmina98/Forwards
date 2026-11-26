@@ -855,26 +855,34 @@ def zdm_tabla(precios: pd.Series, letam: pd.DataFrame, fecha_op: date, tamar: pd
 
 
 # ================================================================ INFLACIÓN ESPERADA (REM) Y CER NOMINAL
-def load_rem_inflacion(path: Path | None = None) -> tuple[pd.Series, dict[int, float]]:
-    """IPC nivel general del REM (mediana): (Series Period[M] → var. mensual decimal,
-    {año: var. i.a. diciembre decimal})."""
+def load_rem_inflacion(path: Path | None = None, top10: bool = False) -> tuple[pd.Series, dict, tuple | None]:
+    """IPC nivel general del REM (mediana). top10=True usa la hoja 'Resultados TOP 10'.
+    Devuelve (Series Period[M] → var. mensual, {año: var. i.a. a diciembre},
+    (Period del fin de 'próx. 12 meses', var. i.a.) o None)."""
     path = path or archivo_rem()
     if path is None:
-        return pd.Series(dtype=float), {}
+        return pd.Series(dtype=float), {}, None
     import openpyxl
+    import re as _re
     import warnings
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
-    ws = next(w for w in wb.worksheets if "cuadro" in w.title.lower())
+    if top10:
+        ws = next(w for w in wb.worksheets if "top" in w.title.lower())
+    else:
+        ws = next(w for w in wb.worksheets if "cuadro" in w.title.lower())
     filas = list(ws.iter_rows(values_only=True))
     wb.close()
     i0 = next(i for i, r in enumerate(filas)
               if any(isinstance(c, str) and "nivel general" in c.lower() for c in r))
     enc = filas[i0 + 1]
     col_per = next(j for j, c in enumerate(enc) if isinstance(c, str) and c.strip().lower() == "período")
+    col_ref = col_per + 1
     col_med = next(j for j, c in enumerate(enc) if isinstance(c, str) and c.strip().lower() == "mediana")
-    mensual, anual = {}, {}
+    mensual, anual, doce = {}, {}, None
+    meses_es = {"ene": 1, "feb": 2, "mar": 3, "abr": 4, "may": 5, "jun": 6, "jul": 7, "ago": 8,
+                "sep": 9, "oct": 10, "nov": 11, "dic": 12}
     for r in filas[i0 + 2:]:
         per, med = r[col_per], r[col_med]
         if per is None or (isinstance(per, str) and not per.strip()):
@@ -883,9 +891,13 @@ def load_rem_inflacion(path: Path | None = None) -> tuple[pd.Series, dict[int, f
             continue
         if hasattr(per, "year"):
             mensual[pd.Period(per, "M")] = float(med) / 100
-        elif isinstance(per, (str, int)) and str(per).strip().isdigit():
+        elif str(per).strip().isdigit():
             anual[int(str(per).strip())] = float(med) / 100
-    return pd.Series(mensual).sort_index(), anual
+        elif "12 meses" in str(per):
+            m = _re.search(r"([a-z]{3})-(\d{2})", str(r[col_ref] or ""))
+            if m and m.group(1) in meses_es:
+                doce = (pd.Period(f"20{m.group(2)}-{meses_es[m.group(1)]:02d}", "M"), float(med) / 100)
+    return pd.Series(mensual).sort_index(), anual, doce
 
 
 def curva_inflacion(rem_mensual: pd.Series, manual: dict | None, anual_largo: float):

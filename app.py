@@ -356,41 +356,57 @@ def editor_tamar_esperada(lugar: str = "ltm"):
 
 @st.cache_data(show_spinner=False)
 def rem_inflacion(mtime: float):
-    return fw.load_rem_inflacion()
+    return fw.load_rem_inflacion(top10=True), fw.load_rem_inflacion(top10=False)
 
 
 def editor_inflacion(lugar: str = "curva"):
-    """Inflación esperada: REM (IPC nivel general, mediana) + meses siguientes, todo editable."""
+    """Inflación esperada: REM Top 10 (IPC nivel general, mediana) + meses siguientes, todo editable."""
     p = fw.archivo_rem()
     if p is None:
         return None
-    rem, anual = rem_inflacion(p.stat().st_mtime)
+    (rem, anual, doce), (_, anual_gral, _) = rem_inflacion(p.stat().st_mtime)
     if rem.empty:
         return None
     ultimo = rem.index[-1]
     hasta = pd.Period(f"{ultimo.year + (1 if ultimo.month == 12 else 0)}-12", "M")
     meses_man = pd.period_range(ultimo + 1, hasta, freq="M")
-    # por defecto: el mensual que hace cerrar ese año en la inflación anual del REM
-    conocidos = [rem.get(pd.Period(f"{hasta.year}-{m:02d}", "M")) for m in range(1, 13)]
-    conocidos = [c for c in conocidos if c is not None and not pd.isna(c)]
+
+    def prod(meses):
+        return float(np.prod([1 + rem[m] for m in meses if m in rem.index]))
+    # Por defecto, en orden: cerrar el año en la anual del Top 10; si no está, que los 12 meses del
+    # Top 10 den lo que dice; si no, repetir el último mes.
     if hasta.year in anual and len(meses_man):
-        defecto = ((1 + anual[hasta.year]) / np.prod([1 + c for c in conocidos])) ** (1 / len(meses_man)) - 1
+        del_anio = [m for m in rem.index if m.year == hasta.year]
+        defecto = ((1 + anual[hasta.year]) / prod(del_anio)) ** (1 / len(meses_man)) - 1
+        origen = f"cierran {hasta.year} en la anual del Top 10 ({anual[hasta.year]:.1%})"
+    elif doce is not None and doce[0] > ultimo:
+        fin, val = doce
+        ventana = pd.period_range(fin - 11, fin, freq="M")
+        faltan = [m for m in ventana if m not in rem.index]
+        defecto = ((1 + val) / prod(ventana)) ** (1 / len(faltan)) - 1 if faltan else float(rem.iloc[-1])
+        origen = (f"hacen que los 12 meses a {fin.strftime('%b-%y')} den el {val:.1%} del Top 10 "
+                  f"(próx. 12 meses)")
     else:
         defecto = float(rem.iloc[-1])
-    defecto_largo = anual.get(hasta.year + 1, (1 + defecto) ** 12 - 1)
-    with st.expander(f"Inflación esperada para el CER: REM hasta {ultimo.strftime('%b-%y')} + tus supuestos"):
+        origen = f"repiten el último mes del Top 10"
+    anio_largo = hasta.year + 1
+    if anio_largo in anual:
+        defecto_largo, origen_largo = anual[anio_largo], f"la del Top 10 para {anio_largo}"
+    elif anio_largo in anual_gral:
+        defecto_largo, origen_largo = anual_gral[anio_largo], f"la del REM general para {anio_largo} (el Top 10 no la trae)"
+    else:
+        defecto_largo, origen_largo = (1 + defecto) ** 12 - 1, "la de los meses anteriores, anualizada"
+    with st.expander(f"Inflación esperada para el CER: REM Top 10 hasta {ultimo.strftime('%b-%y')} + tus supuestos"):
         vals = _editor_rem("infl_manual", lugar, rem, meses_man, defecto, "Inflación (% mensual)",
                            "%.3f", 0.05, -5.0, 50.0, otras_claves=("infl_largo_val",))
         n = st.session_state.get("infl_manual_reset", 0)
-        largo = st.number_input(f"Inflación de {hasta.year + 1} en adelante (% anual)", min_value=-10.0,
+        largo = st.number_input(f"Inflación de {anio_largo} en adelante (% anual)", min_value=-10.0,
                                 max_value=500.0, step=0.5, format="%.2f",
                                 value=float(st.session_state.get("infl_largo_val", round(defecto_largo * 100, 2))),
                                 key=f"infl_largo_{lugar}_{n}")
         st.session_state["infl_largo_val"] = largo
-        anual_txt = ", ".join(f"{k}: {v:.1%}" for k, v in sorted(anual.items()))
-        st.caption(f"Por defecto, los meses de {hasta.year} después de {ultimo.strftime('%b-%y')} cierran el año "
-                   f"en la inflación anual del REM ({anual_txt}); {hasta.year + 1} en adelante usa la del REM "
-                   f"para {hasta.year + 1}.")
+        st.caption(f"REM Top 10 (mediana). Por defecto, los meses después de {ultimo.strftime('%b-%y')} "
+                   f"{origen}; {anio_largo} en adelante usa {origen_largo}.")
     return fw.curva_inflacion(rem.iloc[:0], {m: v / 100 for m, v in vals.items()}, largo / 100)
 
 
