@@ -292,8 +292,9 @@ def rem_tamar(mtime: float):
     return fw.load_rem_tamar()
 
 
-def editor_tamar_esperada():
-    """Curva de TAMAR esperada para el ZDM: REM (mediana) + tus valores para los meses que siguen."""
+def editor_tamar_esperada(lugar: str = "ltm"):
+    """Curva de TAMAR esperada: REM (mediana) + tus valores para los meses que siguen.
+    Tus valores se guardan en la sesión y se comparten entre la solapa Letam y Curvas."""
     p = fw.archivo_rem()
     if p is None:
         return None
@@ -310,14 +311,18 @@ def editor_tamar_esperada():
         c1.dataframe(pd.DataFrame({"Mes": [m.strftime("%b-%y") for m in rem.index],
                                    "TAMAR REM": rem.values}).style.format({"TAMAR REM": "{:.2%}"}),
                      hide_index=True, use_container_width=True)
+        guardados = st.session_state.setdefault("tamar_manual_vals", {})
+        defecto = round(float(rem.iloc[-1]) * 100, 2)
         base_man = pd.DataFrame({"Mes": [m.strftime("%b-%y") for m in meses_man],
-                                 "TAMAR (TNA %)": [round(float(rem.iloc[-1]) * 100, 2)] * len(meses_man)})
-        ed = c2.data_editor(base_man, key=f"tamar_manual_{ultimo}", hide_index=True,
+                                 "TAMAR (TNA %)": [guardados.get(str(m), defecto) for m in meses_man]})
+        ed = c2.data_editor(base_man, key=f"tamar_manual_{lugar}_{ultimo}", hide_index=True,
                             disabled=["Mes"], use_container_width=True,
                             column_config={"TAMAR (TNA %)": st.column_config.NumberColumn(
                                 min_value=0.0, max_value=200.0, step=0.25, format="%.2f")})
         c2.caption(f"Arrancan con la de {ultimo.strftime('%b-%y')}. Después de {hasta.strftime('%b-%y')} "
                    "se mantiene tu último valor.")
+    st.session_state["tamar_manual_vals"] = {str(m): v for m, v in zip(meses_man, ed["TAMAR (TNA %)"])
+                                             if pd.notna(v)}
     manual = {m: (v / 100 if pd.notna(v) else None) for m, v in zip(meses_man, ed["TAMAR (TNA %)"])}
     return fw.curva_tamar_esperada(rem, manual)
 
@@ -570,15 +575,15 @@ def vista_canje():
 
 
 # ---------------------------------------------------------------- curvas ajustadas
-AZUL, GRIS = "#1f6feb", "#8b949e"
+AZUL, GRIS, NARANJA = "#1f6feb", "#8b949e", "#d29922"
 
 
 def precios_de(fecha):
     return precios_hoy if fecha == fecha_px else hist.loc[fecha]
 
 
-def puntos_curva(curva: str, fecha, sel_hd: list[str], en_margen: bool = False,
-                 con_duales: bool = False) -> pd.DataFrame:
+def puntos_curva(curva: str, fecha, sel_hd: list[str], eje: str = "Tasa directa",
+                 con_duales: bool = False, curva_rem=None) -> pd.DataFrame:
     px = precios_de(fecha)
     liq = fw.sumar_habiles(fecha, plazo, feriados) if plazo else fecha
     if curva == "Tasa fija":
@@ -594,15 +599,35 @@ def puntos_curva(curva: str, fecha, sel_hd: list[str], en_margen: bool = False,
                 if fecha == fecha_px and "tamar_proy" in st.session_state else fw.tamar_al(fecha, tamar))
         base_t = pd.concat([letam, duales_tamar], ignore_index=True) if con_duales else letam
         p = fw.puntos_cero_cupon(px, fw.letam_a_fecha(base_t, fecha, tamar, proy, feriados), liq)
-        if en_margen:  # TIR (TEA) → margen sobre TAMAR, sin pasar por la unidad de la barra lateral
+        if eje == "Margen sobre TAMAR":  # TIR (TEA) → margen, sin pasar por la unidad de la barra lateral
             p = p.dropna(subset=["TIR", "duration"]).copy()
             p["TIR"] = fw.margen_tamar(p["TIR"], proy)
             return p.sort_values("duration").reset_index(drop=True)
+        if eje == "ZDM (REM)" and curva_rem is not None:
+            z = fw.zdm_tabla(px, base_t, fecha, tamar, curva_rem, feriados, plazo)
+            p = p.drop(columns="TIR").merge(z[["ticker", "zdm"]].rename(columns={"zdm": "TIR"}), on="ticker")
+            p = p.dropna(subset=["TIR", "duration"])
+            return p.sort_values("duration").reset_index(drop=True)
+    elif curva == "Pesos (fija + TAMAR)":
+        # Lecaps + Letam con su TIR nominal: el pago de las Letam se proyecta con tu curva de TAMAR
+        # (REM + tus meses); sin REM, con la TAMAR publicada ese día constante.
+        proy = curva_rem if curva_rem is not None else fw.tamar_al(fecha, tamar)
+        pl = fw.puntos_cero_cupon(px, lecaps, liq)
+        pt = fw.puntos_cero_cupon(px, fw.letam_a_fecha(letam, fecha, tamar, proy, feriados), liq)
+        p = pd.concat([pl, pt], ignore_index=True)
     else:
         p = fw.puntos_hd(px, flujos, liq, "D" if curva == "HD MEP" else "C", sel_hd)
     p = p.dropna(subset=["TIR", "duration"]).copy()
     p["TIR"] = fw.tasa_hd(p["TIR"], tipo)  # misma unidad que el resto de la app
     return p.sort_values("duration").reset_index(drop=True)
+
+
+def plana_fuera_de_rango(fn, duraciones):
+    """La curva ajustada fuera del rango de los bonos del ajuste sigue plana (no extrapola la forma)."""
+    if fn is None or len(duraciones) == 0:
+        return fn
+    lo, hi = float(np.min(duraciones)), float(np.max(duraciones))
+    return lambda x: fn(np.clip(np.asarray(x, dtype=float), lo, hi))
 
 
 def fecha_anterior(objetivo):
@@ -612,14 +637,28 @@ def fecha_anterior(objetivo):
 
 def vista_curvas():
     c1, c2 = st.columns([3, 1])
-    curva = c1.radio("Curva", ["Tasa fija", "CER", "TAMAR", "HD MEP", "HD Cable"], horizontal=True,
-                     key="curva_tipo")
+    curva = c1.radio("Curva", ["Tasa fija", "CER", "TAMAR", "Pesos (fija + TAMAR)", "HD MEP", "HD Cable"],
+                     horizontal=True, key="curva_tipo")
     modelo = c2.selectbox("Ajuste", ["Nelson-Siegel", "Logarítmica"], key="curva_modelo")
     sel_hd = filtro_ley("curva") if curva.startswith("HD") else []
-    en_margen = curva == "TAMAR" and st.radio(
-        "Eje vertical", ["Tasa directa", "Margen sobre TAMAR"], horizontal=True,
-        key="curva_tamar_eje") == "Margen sobre TAMAR"
-    con_duales = curva in ("CER", "TAMAR") and (not duales.empty) and st.checkbox(
+    eje = st.radio("Eje vertical", ["Tasa directa", "Margen sobre TAMAR", "ZDM (REM)"], horizontal=True,
+                   key="curva_tamar_eje") if curva == "TAMAR" else "Tasa directa"
+    en_margen = eje != "Tasa directa"
+    curva_rem = None
+    if curva == "Pesos (fija + TAMAR)" or eje == "ZDM (REM)":
+        curva_rem = editor_tamar_esperada("curva")
+        if curva_rem is None and eje == "ZDM (REM)":
+            st.info("Para el ZDM hace falta el REM en el repo (relevamiento-expectativas-mercado-tablas-AAAA-MM.xlsx).")
+            return
+    solo_fija = curva == "Pesos (fija + TAMAR)" and st.radio(
+        "Ajustar la curva con", ["Solo tasa fija", "Lecaps y Letam"], horizontal=True,
+        key="curva_pesos_ajuste") == "Solo tasa fija"
+    if curva == "Pesos (fija + TAMAR)":
+        st.caption("Letam con su TIR nominal: el pago se proyecta con la TAMAR esperada (REM + tus meses). "
+                   + ("La curva se ajusta solo con Lecaps: el spread de cada Letam dice si está rica o barata "
+                      "contra la tasa fija, según tu visión de TAMAR." if solo_fija else
+                      "La curva se ajusta con Lecaps y Letam juntas."))
+    con_duales = curva in ("CER", "TAMAR") and eje != "ZDM (REM)" and (not duales.empty) and st.checkbox(
         f"Incluir duales CER-TAMAR (pata {curva})", key="curva_duales")
     if con_duales:
         st.caption(f"ℹ️ Duales con ◆. Pagan el máximo entre CER y TAMAR: su tasa por la pata {curva} es un "
@@ -639,14 +678,20 @@ def vista_curvas():
         dias = {"1 semana antes": 7, "1 mes antes": 30, "3 meses antes": 91}[comp]
         fecha_c = fecha_anterior(fecha - timedelta(days=dias))
 
-    p = puntos_curva(curva, fecha, sel_hd, en_margen, con_duales)
+    p = puntos_curva(curva, fecha, sel_hd, eje, con_duales, curva_rem)
     if len(p) < 2:
         st.info("No hay suficientes bonos con precio para armar la curva en esa fecha.")
         return
     excluir = st.multiselect("Excluir del ajuste (se siguen mostrando)", p.ticker.tolist(),
                              key=f"curva_excl_{curva}_{int(con_duales)}")
+    es_letam = p.ticker.isin(set(letam.ticker))
     usar = ~p.ticker.isin(excluir)
+    if solo_fija:
+        usar = usar & ~es_letam
     fn, desc = fw.ajustar_curva(p.duration[usar], p.TIR[usar], modelo)
+    fn = plana_fuera_de_rango(fn, p.duration[usar])
+    extrap = p.loc[(p.duration > p.duration[usar].max() + 1e-9) | (p.duration < p.duration[usar].min() - 1e-9),
+                   "ticker"].tolist() if fn is not None else []
     if fn is None:
         st.info(desc)
         return
@@ -655,23 +700,31 @@ def vista_curvas():
 
     pc, fn_c = None, None
     if fecha_c is not None:
-        pc = puntos_curva(curva, fecha_c, sel_hd, en_margen, con_duales)
+        pc = puntos_curva(curva, fecha_c, sel_hd, eje, con_duales, curva_rem)
         pc = pc[~pc.ticker.isin(excluir)]
         if len(pc) >= 2:
-            fn_c, _ = fw.ajustar_curva(pc.duration, pc.TIR, modelo)
+            usar_c = ~pc.ticker.isin(set(letam.ticker)) if solo_fija else pc.ticker.notna()
+            fn_c, _ = fw.ajustar_curva(pc.duration[usar_c], pc.TIR[usar_c], modelo)
+            fn_c = plana_fuera_de_rango(fn_c, pc.duration[usar_c])
             p = p.merge(pc[["ticker", "TIR"]].rename(columns={"TIR": "TIR_c"}), on="ticker", how="left")
             p["var"] = (p.TIR - p.TIR_c) * 1e4
 
     unidad = "s/TAMAR" if en_margen else f"{tipo}{' real' if curva == 'CER' else ''}"
-    nom = "Margen" if en_margen else "TIR"
+    nom = {"Margen sobre TAMAR": "Margen", "ZDM (REM)": "ZDM"}.get(eje, "TIR")
     if curva == "TAMAR":
         st.caption("Letam: TIR con el pago final estimado con la TAMAR proyectada (hoy, la de la solapa "
                    "Letam; en otras fechas, la publicada ese día). Con menos de 6 especies el ajuste "
                    "pasa a logarítmico.")
-    if en_margen:
+    if eje == "Margen sobre TAMAR":
         st.caption("Margen sobre TAMAR = 12 × ((1 + TEA)^(1/12) − 1) − TAMAR proyectada.")
+    elif eje == "ZDM (REM)":
+        st.caption("ZDM = spread sobre la TAMAR esperada mes a mes (REM + tus meses). Letam que vencen "
+                   "después del último mes de la curva usan tu último valor plano.")
     st.caption(f"{desc}. Ajuste sobre {nom} ({unidad}) contra duration en años. Spread = {nom} − curva: "
                "positivo = el bono rinde más que la curva (**barato**); negativo = **rico**.")
+    if extrap:
+        st.caption(f"⚠️ {', '.join(extrap)}: fuera del rango de los bonos del ajuste; la curva se extiende "
+                   "plana, así que su spread depende de ese supuesto.")
 
     # ---- gráfico
     xs = np.linspace(max(p.duration.min() * 0.9, 1e-3), p.duration.max() * 1.03, 200)
@@ -687,15 +740,20 @@ def vista_curvas():
     fig.add_scatter(x=xs, y=fn(xs), mode="lines", name=f"Curva {fecha:%d-%m-%y}",
                     line=dict(color=AZUL, width=2), hoverinfo="skip")
     dual = p.ticker.isin(es_dual)
-    for incl, nombre, simbolo in [(usar & ~dual, f"Bonos {fecha:%d-%m-%y}", "circle"),
-                                  (usar & dual, "Duales CER-TAMAR", "diamond"),
-                                  (~usar, "Excluidos del ajuste", "x")]:
+    pesos = curva == "Pesos (fija + TAMAR)"
+    grupos = [(usar & ~dual & ~(es_letam & pesos), "Lecaps" if pesos else f"Bonos {fecha:%d-%m-%y}",
+               "circle", AZUL),
+              (usar & dual, "Duales CER-TAMAR", "diamond", AZUL),
+              (es_letam & pesos, "Letam (TAMAR esperada)" + (" · fuera del ajuste" if solo_fija else ""),
+               "square", NARANJA),
+              (~usar & ~(es_letam & pesos), "Excluidos del ajuste", "x", AZUL)]
+    for incl, nombre, simbolo, color in grupos:
         q = p[incl]
         if q.empty:
             continue
         fig.add_scatter(x=q.duration, y=q.TIR, mode="markers+text", name=nombre, text=q.ticker,
                         textposition="top center", textfont=dict(size=11),
-                        marker=dict(color=AZUL, size=9, symbol=simbolo,
+                        marker=dict(color=color, size=9, symbol=simbolo,
                                     line=dict(color="white", width=1)),
                         customdata=np.column_stack([q.ticker, q.spread]),
                         hovertemplate="%{customdata[0]}<br>Duration %{x:.2f}<br>" + nom
