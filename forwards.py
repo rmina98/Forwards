@@ -852,3 +852,81 @@ def zdm_tabla(precios: pd.Series, letam: pd.DataFrame, fecha_op: date, tamar: pd
                       "zdm": zdm_letam(p, vf, liq, b.vencimiento, curva),
                       "extrapolado": pd.Period(b.vencimiento, "M") > curva.ultimo_mes})
     return pd.DataFrame(filas)
+
+
+# ================================================================ INFLACIÓN ESPERADA (REM) Y CER NOMINAL
+def load_rem_inflacion(path: Path | None = None) -> tuple[pd.Series, dict[int, float]]:
+    """IPC nivel general del REM (mediana): (Series Period[M] → var. mensual decimal,
+    {año: var. i.a. diciembre decimal})."""
+    path = path or archivo_rem()
+    if path is None:
+        return pd.Series(dtype=float), {}
+    import openpyxl
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    ws = next(w for w in wb.worksheets if "cuadro" in w.title.lower())
+    filas = list(ws.iter_rows(values_only=True))
+    wb.close()
+    i0 = next(i for i, r in enumerate(filas)
+              if any(isinstance(c, str) and "nivel general" in c.lower() for c in r))
+    enc = filas[i0 + 1]
+    col_per = next(j for j, c in enumerate(enc) if isinstance(c, str) and c.strip().lower() == "período")
+    col_med = next(j for j, c in enumerate(enc) if isinstance(c, str) and c.strip().lower() == "mediana")
+    mensual, anual = {}, {}
+    for r in filas[i0 + 2:]:
+        per, med = r[col_per], r[col_med]
+        if per is None or (isinstance(per, str) and not per.strip()):
+            break
+        if not isinstance(med, (int, float)):
+            continue
+        if hasattr(per, "year"):
+            mensual[pd.Period(per, "M")] = float(med) / 100
+        elif isinstance(per, (str, int)) and str(per).strip().isdigit():
+            anual[int(str(per).strip())] = float(med) / 100
+    return pd.Series(mensual).sort_index(), anual
+
+
+def curva_inflacion(rem_mensual: pd.Series, manual: dict | None, anual_largo: float):
+    """Función Period[M] → inflación mensual esperada. Mes manual > REM; antes del primer dato, el
+    primero; después del último mes definido, la inflación anual de largo plazo pasada a mensual."""
+    meses = dict(rem_mensual.items())
+    if manual:
+        meses.update({pd.Period(k, "M"): v for k, v in manual.items() if v is not None and not pd.isna(v)})
+    serie = pd.Series(meses).sort_index()
+    primero, ultimo = serie.index[0], serie.index[-1]
+    largo = (1 + anual_largo) ** (1 / 12) - 1
+
+    def f(p: pd.Period) -> float:
+        if p in serie.index:
+            return float(serie[p])
+        return float(serie.iloc[0]) if p < primero else largo
+    f.ultimo_mes = ultimo
+    return f
+
+
+def proyectar_cer(hasta: date, cer: pd.Series, inflacion) -> float:
+    """CER proyectado a una fecha. Desde el último dato publicado avanza día a día: entre el 16 de un
+    mes y el 15 del siguiente el CER refleja la inflación del mes anterior (en forma geométrica)."""
+    if hasta <= cer.index[-1]:
+        d = cer.loc[:hasta]
+        return float(d.iloc[-1]) if len(d) else float("nan")
+    valor, d = float(cer.iloc[-1]), cer.index[-1]
+    while d < hasta:
+        d += timedelta(days=1)
+        inicio = pd.Period(d, "M") if d.day >= 16 else pd.Period(d, "M") - 1  # el período arranca el 16
+        dias_periodo = inicio.days_in_month
+        valor *= (1 + inflacion(inicio - 1)) ** (1 / dias_periodo)
+    return valor
+
+
+def lecer_nominal(lecer: pd.DataFrame, cer: pd.Series, inflacion, feriados: set[date]) -> pd.DataFrame:
+    """Copia de la hoja LECER con 'vf' = pago nominal esperado al vencimiento (CER proyectado al
+    día de referencia del pago, 10 hábiles antes del cobro)."""
+    df = lecer.copy()
+    refs = [ref_cer_vto(v, feriados) for v in df.vencimiento]
+    df["cer_ref_vto"] = [proyectar_cer(r, cer, inflacion) for r in refs]
+    df["cer_proyectado"] = [r > cer.index[-1] for r in refs]
+    df["vf"] = df["vf_base"] * df["cer_ref_vto"]
+    return df

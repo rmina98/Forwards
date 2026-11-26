@@ -327,6 +327,58 @@ def editor_tamar_esperada(lugar: str = "ltm"):
     return fw.curva_tamar_esperada(rem, manual)
 
 
+@st.cache_data(show_spinner=False)
+def rem_inflacion(mtime: float):
+    return fw.load_rem_inflacion()
+
+
+def editor_inflacion(lugar: str = "curva"):
+    """Inflación esperada: REM (mediana, IPC nivel general) + tus valores; se guarda en la sesión."""
+    p = fw.archivo_rem()
+    if p is None:
+        return None
+    rem, anual = rem_inflacion(p.stat().st_mtime)
+    if rem.empty:
+        return None
+    ultimo = rem.index[-1]
+    hasta = pd.Period(f"{ultimo.year + (1 if ultimo.month == 12 else 0)}-12", "M")
+    meses_man = pd.period_range(ultimo + 1, hasta, freq="M")
+    # por defecto: el mensual que hace cerrar ese año en la inflación anual del REM
+    conocidos = [rem.get(pd.Period(f"{hasta.year}-{m:02d}", "M")) for m in range(1, 13)]
+    conocidos = [c for c in conocidos if c is not None and not pd.isna(c)]
+    if hasta.year in anual and len(meses_man):
+        defecto = ((1 + anual[hasta.year]) / np.prod([1 + c for c in conocidos])) ** (1 / len(meses_man)) - 1
+    else:
+        defecto = float(rem.iloc[-1])
+    defecto_largo = anual.get(hasta.year + 1, (1 + defecto) ** 12 - 1)
+    guardados = st.session_state.setdefault("infl_manual_vals", {})
+    with st.expander(f"Inflación esperada para el CER: REM hasta {ultimo.strftime('%b-%y')} + tus supuestos"):
+        c1, c2 = st.columns([1, 2])
+        c1.markdown("**REM, IPC nivel general** (mediana, % mensual)")
+        c1.dataframe(pd.DataFrame({"Mes": [m.strftime("%b-%y") for m in rem.index],
+                                   "Inflación": rem.values}).style.format({"Inflación": "{:.2%}"}),
+                     hide_index=True, use_container_width=True)
+        base_man = pd.DataFrame({"Mes": [m.strftime("%b-%y") for m in meses_man],
+                                 "Inflación (% mensual)": [guardados.get(str(m), round(defecto * 100, 3))
+                                                           for m in meses_man]})
+        ed = c2.data_editor(base_man, key=f"infl_manual_{lugar}_{ultimo}", hide_index=True,
+                            disabled=["Mes"], use_container_width=True,
+                            column_config={"Inflación (% mensual)": st.column_config.NumberColumn(
+                                min_value=-5.0, max_value=50.0, step=0.05, format="%.3f")})
+        largo = c2.number_input(f"Inflación de {hasta.year + 1} en adelante (% anual)", min_value=-10.0,
+                                max_value=500.0, step=0.5, format="%.2f",
+                                value=float(guardados.get("largo", round(defecto_largo * 100, 2))),
+                                key=f"infl_largo_{lugar}")
+        anual_txt = ", ".join(f"{k}: {v:.1%}" for k, v in sorted(anual.items()))
+        c2.caption(f"Por defecto, los meses de {hasta.year} cierran el año en la inflación anual del REM "
+                   f"({anual_txt}), y {hasta.year + 1} en adelante usa la del REM para {hasta.year + 1}.")
+    vals = {str(m): v for m, v in zip(meses_man, ed["Inflación (% mensual)"]) if pd.notna(v)}
+    vals["largo"] = largo
+    st.session_state["infl_manual_vals"] = vals
+    manual = {m: (v / 100 if pd.notna(v) else None) for m, v in zip(meses_man, ed["Inflación (% mensual)"])}
+    return fw.curva_inflacion(rem, manual, largo / 100)
+
+
 def vista_tabla_letam(proy_hoy: float, en_margen: bool, base_ltm: pd.DataFrame, curva_rem=None):
     c1, c2 = st.columns([1, 3])
     opciones = [fecha_px] + [d for d in reversed(hist.index) if d != fecha_px]
@@ -575,7 +627,7 @@ def vista_canje():
 
 
 # ---------------------------------------------------------------- curvas ajustadas
-AZUL, GRIS, NARANJA = "#1f6feb", "#8b949e", "#d29922"
+AZUL, GRIS, NARANJA, VERDE = "#1f6feb", "#8b949e", "#d29922", "#2da44e"
 
 
 def precios_de(fecha):
@@ -583,7 +635,8 @@ def precios_de(fecha):
 
 
 def puntos_curva(curva: str, fecha, sel_hd: list[str], eje: str = "Tasa directa",
-                 con_duales: bool = False, curva_rem=None) -> pd.DataFrame:
+                 con_duales: bool = False, curva_rem=None, curva_infl=None,
+                 familias: tuple = ("Letam", "CER")) -> pd.DataFrame:
     px = precios_de(fecha)
     liq = fw.sumar_habiles(fecha, plazo, feriados) if plazo else fecha
     if curva == "Tasa fija":
@@ -608,13 +661,17 @@ def puntos_curva(curva: str, fecha, sel_hd: list[str], eje: str = "Tasa directa"
             p = p.drop(columns="TIR").merge(z[["ticker", "zdm"]].rename(columns={"zdm": "TIR"}), on="ticker")
             p = p.dropna(subset=["TIR", "duration"])
             return p.sort_values("duration").reset_index(drop=True)
-    elif curva == "Pesos (fija + TAMAR)":
+    elif curva == "Pesos (fija + TAMAR + CER)":
         # Lecaps + Letam con su TIR nominal: el pago de las Letam se proyecta con tu curva de TAMAR
         # (REM + tus meses); sin REM, con la TAMAR publicada ese día constante.
-        proy = curva_rem if curva_rem is not None else fw.tamar_al(fecha, tamar)
-        pl = fw.puntos_cero_cupon(px, lecaps, liq)
-        pt = fw.puntos_cero_cupon(px, fw.letam_a_fecha(letam, fecha, tamar, proy, feriados), liq)
-        p = pd.concat([pl, pt], ignore_index=True)
+        partes = [fw.puntos_cero_cupon(px, lecaps, liq)]
+        if "Letam" in familias:
+            proy = curva_rem if curva_rem is not None else fw.tamar_al(fecha, tamar)
+            partes.append(fw.puntos_cero_cupon(px, fw.letam_a_fecha(letam, fecha, tamar, proy, feriados), liq))
+        if "CER" in familias and curva_infl is not None:
+            # CER con su TIR nominal: CER proyectado al día de referencia del pago con tu inflación
+            partes.append(fw.puntos_cero_cupon(px, fw.lecer_nominal(lecer, cer, curva_infl, feriados), liq))
+        p = pd.concat(partes, ignore_index=True)
     else:
         p = fw.puntos_hd(px, flujos, liq, "D" if curva == "HD MEP" else "C", sel_hd)
     p = p.dropna(subset=["TIR", "duration"]).copy()
@@ -637,7 +694,7 @@ def fecha_anterior(objetivo):
 
 def vista_curvas():
     c1, c2 = st.columns([3, 1])
-    curva = c1.radio("Curva", ["Tasa fija", "CER", "TAMAR", "Pesos (fija + TAMAR)", "HD MEP", "HD Cable"],
+    curva = c1.radio("Curva", ["Tasa fija", "CER", "TAMAR", "Pesos (fija + TAMAR + CER)", "HD MEP", "HD Cable"],
                      horizontal=True, key="curva_tipo")
     modelo = c2.selectbox("Ajuste", ["Nelson-Siegel", "Logarítmica"], key="curva_modelo")
     sel_hd = filtro_ley("curva") if curva.startswith("HD") else []
@@ -645,19 +702,26 @@ def vista_curvas():
                    key="curva_tamar_eje") if curva == "TAMAR" else "Tasa directa"
     en_margen = eje != "Tasa directa"
     curva_rem = None
-    if curva == "Pesos (fija + TAMAR)" or eje == "ZDM (REM)":
+    if curva == "Pesos (fija + TAMAR + CER)" or eje == "ZDM (REM)":
         curva_rem = editor_tamar_esperada("curva")
         if curva_rem is None and eje == "ZDM (REM)":
             st.info("Para el ZDM hace falta el REM en el repo (relevamiento-expectativas-mercado-tablas-AAAA-MM.xlsx).")
             return
-    solo_fija = curva == "Pesos (fija + TAMAR)" and st.radio(
-        "Ajustar la curva con", ["Solo tasa fija", "Lecaps y Letam"], horizontal=True,
+    curva_infl, familias = None, ()
+    if curva == "Pesos (fija + TAMAR + CER)":
+        familias = tuple(st.multiselect("Sumar a las Lecaps", ["Letam", "CER"], default=["Letam", "CER"],
+                                        key="curva_pesos_familias"))
+        if "CER" in familias:
+            curva_infl = editor_inflacion("curva")
+    solo_fija = curva == "Pesos (fija + TAMAR + CER)" and st.radio(
+        "Ajustar la curva con", ["Solo tasa fija", "Todos los incluidos"], horizontal=True,
         key="curva_pesos_ajuste") == "Solo tasa fija"
-    if curva == "Pesos (fija + TAMAR)":
-        st.caption("Letam con su TIR nominal: el pago se proyecta con la TAMAR esperada (REM + tus meses). "
-                   + ("La curva se ajusta solo con Lecaps: el spread de cada Letam dice si está rica o barata "
-                      "contra la tasa fija, según tu visión de TAMAR." if solo_fija else
-                      "La curva se ajusta con Lecaps y Letam juntas."))
+    if curva == "Pesos (fija + TAMAR + CER)":
+        st.caption("Todo en TIR nominal. Letam: pago proyectado con la TAMAR esperada (REM + tus meses). "
+                   "CER: pago proyectado con la inflación esperada (REM + tus meses). "
+                   + ("La curva se ajusta solo con Lecaps: el spread de cada Letam o CER dice si está rico o "
+                      "barato contra la tasa fija, según tu visión de TAMAR e inflación." if solo_fija else
+                      "La curva se ajusta con todos los incluidos."))
     con_duales = curva in ("CER", "TAMAR") and eje != "ZDM (REM)" and (not duales.empty) and st.checkbox(
         f"Incluir duales CER-TAMAR (pata {curva})", key="curva_duales")
     if con_duales:
@@ -678,16 +742,17 @@ def vista_curvas():
         dias = {"1 semana antes": 7, "1 mes antes": 30, "3 meses antes": 91}[comp]
         fecha_c = fecha_anterior(fecha - timedelta(days=dias))
 
-    p = puntos_curva(curva, fecha, sel_hd, eje, con_duales, curva_rem)
+    p = puntos_curva(curva, fecha, sel_hd, eje, con_duales, curva_rem, curva_infl, familias)
     if len(p) < 2:
         st.info("No hay suficientes bonos con precio para armar la curva en esa fecha.")
         return
     excluir = st.multiselect("Excluir del ajuste (se siguen mostrando)", p.ticker.tolist(),
                              key=f"curva_excl_{curva}_{int(con_duales)}")
     es_letam = p.ticker.isin(set(letam.ticker))
+    es_cer = p.ticker.isin(set(lecer.ticker))
     usar = ~p.ticker.isin(excluir)
     if solo_fija:
-        usar = usar & ~es_letam
+        usar = usar & ~es_letam & ~es_cer
     fn, desc = fw.ajustar_curva(p.duration[usar], p.TIR[usar], modelo)
     fn = plana_fuera_de_rango(fn, p.duration[usar])
     extrap = p.loc[(p.duration > p.duration[usar].max() + 1e-9) | (p.duration < p.duration[usar].min() - 1e-9),
@@ -700,10 +765,11 @@ def vista_curvas():
 
     pc, fn_c = None, None
     if fecha_c is not None:
-        pc = puntos_curva(curva, fecha_c, sel_hd, eje, con_duales, curva_rem)
+        pc = puntos_curva(curva, fecha_c, sel_hd, eje, con_duales, curva_rem, curva_infl, familias)
         pc = pc[~pc.ticker.isin(excluir)]
         if len(pc) >= 2:
-            usar_c = ~pc.ticker.isin(set(letam.ticker)) if solo_fija else pc.ticker.notna()
+            usar_c = (~pc.ticker.isin(set(letam.ticker) | set(lecer.ticker)) if solo_fija
+                      else pc.ticker.notna())
             fn_c, _ = fw.ajustar_curva(pc.duration[usar_c], pc.TIR[usar_c], modelo)
             fn_c = plana_fuera_de_rango(fn_c, pc.duration[usar_c])
             p = p.merge(pc[["ticker", "TIR"]].rename(columns={"TIR": "TIR_c"}), on="ticker", how="left")
@@ -740,13 +806,15 @@ def vista_curvas():
     fig.add_scatter(x=xs, y=fn(xs), mode="lines", name=f"Curva {fecha:%d-%m-%y}",
                     line=dict(color=AZUL, width=2), hoverinfo="skip")
     dual = p.ticker.isin(es_dual)
-    pesos = curva == "Pesos (fija + TAMAR)"
-    grupos = [(usar & ~dual & ~(es_letam & pesos), "Lecaps" if pesos else f"Bonos {fecha:%d-%m-%y}",
-               "circle", AZUL),
+    pesos = curva == "Pesos (fija + TAMAR + CER)"
+    otros = pesos & (es_letam | es_cer)
+    grupos = [(usar & ~dual & ~otros, "Lecaps" if pesos else f"Bonos {fecha:%d-%m-%y}", "circle", AZUL),
               (usar & dual, "Duales CER-TAMAR", "diamond", AZUL),
               (es_letam & pesos, "Letam (TAMAR esperada)" + (" · fuera del ajuste" if solo_fija else ""),
                "square", NARANJA),
-              (~usar & ~(es_letam & pesos), "Excluidos del ajuste", "x", AZUL)]
+              (es_cer & pesos, "CER (inflación esperada)" + (" · fuera del ajuste" if solo_fija else ""),
+               "triangle-up", VERDE),
+              (~usar & ~otros, "Excluidos del ajuste", "x", AZUL)]
     for incl, nombre, simbolo, color in grupos:
         q = p[incl]
         if q.empty:
