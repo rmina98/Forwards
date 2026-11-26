@@ -292,9 +292,50 @@ def rem_tamar(mtime: float):
     return fw.load_rem_tamar()
 
 
+def _editor_rem(nombre: str, lugar: str, rem: pd.Series, meses_extra, defecto_extra: float,
+                col: str, fmt: str, paso: float, minimo: float, maximo: float,
+                otras_claves: tuple = ()) -> dict:
+    """Tabla editable: meses del REM + meses siguientes. Columna 'REM' de referencia (fija) y columna
+    editable. Los valores se guardan en la sesión (compartidos entre secciones) y un botón vuelve al
+    REM original. Devuelve {Period: valor en %} de todos los meses."""
+    clave, nclave = f"{nombre}_vals", f"{nombre}_reset"
+    guardados = st.session_state.setdefault(clave, {})
+    n = st.session_state.setdefault(nclave, 0)
+    meses = list(rem.index) + list(meses_extra)
+    original = {m: round(float(rem[m]) * 100, 4) for m in rem.index}
+    original.update({m: round(defecto_extra * 100, 4) for m in meses_extra})
+    tabla = pd.DataFrame({
+        "Mes": [m.strftime("%b-%y") for m in meses],
+        "REM": [original[m] if m in rem.index else np.nan for m in meses],
+        col: [guardados.get(str(m), original[m]) for m in meses],
+    })
+    ed = st.data_editor(tabla, key=f"{nombre}_ed_{lugar}_{n}", hide_index=True, disabled=["Mes", "REM"],
+                        use_container_width=True,
+                        column_config={"REM": st.column_config.NumberColumn("REM (original)", format=fmt),
+                                       col: st.column_config.NumberColumn(col, min_value=minimo,
+                                                                          max_value=maximo, step=paso,
+                                                                          format=fmt)})
+    valores = {m: v for m, v in zip(meses, ed[col]) if pd.notna(v)}
+    st.session_state[clave] = {str(m): v for m, v in valores.items()}
+    if st.button("↩️ Volver al REM original", key=f"{nombre}_btn_{lugar}_{n}"):
+        st.session_state[clave] = {}
+        for k in otras_claves:
+            st.session_state.pop(k, None)
+        st.session_state[nclave] = n + 1
+        st.rerun()
+    cambiados = [m.strftime("%b-%y") for m in meses if abs(valores.get(m, original[m]) - original[m]) > 1e-9]
+    if cambiados:
+        st.caption(f"✏️ Modificados: {', '.join(cambiados)}")
+    return valores
+
+
+@st.cache_data(show_spinner=False)
+def rem_tamar(mtime: float):
+    return fw.load_rem_tamar()
+
+
 def editor_tamar_esperada(lugar: str = "ltm"):
-    """Curva de TAMAR esperada: REM (mediana) + tus valores para los meses que siguen.
-    Tus valores se guardan en la sesión y se comparten entre la solapa Letam y Curvas."""
+    """Curva de TAMAR esperada: REM (mediana) + meses siguientes, todo editable."""
     p = fw.archivo_rem()
     if p is None:
         return None
@@ -304,27 +345,13 @@ def editor_tamar_esperada(lugar: str = "ltm"):
     ultimo = rem.index[-1]
     hasta = pd.Period(f"{ultimo.year + (1 if ultimo.month == 12 else 0)}-12", "M")
     meses_man = pd.period_range(ultimo + 1, hasta, freq="M")
-    with st.expander(f"TAMAR esperada para el ZDM: REM hasta {ultimo.strftime('%b-%y')} + tus supuestos "
-                     f"hasta {hasta.strftime('%b-%y')}"):
-        c1, c2 = st.columns([1, 2])
-        c1.markdown(f"**{titulo or p.name}** (mediana)")
-        c1.dataframe(pd.DataFrame({"Mes": [m.strftime("%b-%y") for m in rem.index],
-                                   "TAMAR REM": rem.values}).style.format({"TAMAR REM": "{:.2%}"}),
-                     hide_index=True, use_container_width=True)
-        guardados = st.session_state.setdefault("tamar_manual_vals", {})
-        defecto = round(float(rem.iloc[-1]) * 100, 2)
-        base_man = pd.DataFrame({"Mes": [m.strftime("%b-%y") for m in meses_man],
-                                 "TAMAR (TNA %)": [guardados.get(str(m), defecto) for m in meses_man]})
-        ed = c2.data_editor(base_man, key=f"tamar_manual_{lugar}_{ultimo}", hide_index=True,
-                            disabled=["Mes"], use_container_width=True,
-                            column_config={"TAMAR (TNA %)": st.column_config.NumberColumn(
-                                min_value=0.0, max_value=200.0, step=0.25, format="%.2f")})
-        c2.caption(f"Arrancan con la de {ultimo.strftime('%b-%y')}. Después de {hasta.strftime('%b-%y')} "
-                   "se mantiene tu último valor.")
-    st.session_state["tamar_manual_vals"] = {str(m): v for m, v in zip(meses_man, ed["TAMAR (TNA %)"])
-                                             if pd.notna(v)}
-    manual = {m: (v / 100 if pd.notna(v) else None) for m, v in zip(meses_man, ed["TAMAR (TNA %)"])}
-    return fw.curva_tamar_esperada(rem, manual)
+    with st.expander(f"TAMAR esperada ({titulo or p.name}): REM hasta {ultimo.strftime('%b-%y')} + tus "
+                     f"supuestos hasta {hasta.strftime('%b-%y')}"):
+        vals = _editor_rem("tamar_manual", lugar, rem, meses_man, float(rem.iloc[-1]), "TAMAR (TNA %)",
+                           "%.2f", 0.25, 0.0, 200.0)
+        st.caption(f"Los meses después de {ultimo.strftime('%b-%y')} arrancan con su valor. "
+                   f"Después de {hasta.strftime('%b-%y')} se mantiene el último.")
+    return fw.curva_tamar_esperada(rem.iloc[:0], {m: v / 100 for m, v in vals.items()})
 
 
 @st.cache_data(show_spinner=False)
@@ -333,7 +360,7 @@ def rem_inflacion(mtime: float):
 
 
 def editor_inflacion(lugar: str = "curva"):
-    """Inflación esperada: REM (mediana, IPC nivel general) + tus valores; se guarda en la sesión."""
+    """Inflación esperada: REM (IPC nivel general, mediana) + meses siguientes, todo editable."""
     p = fw.archivo_rem()
     if p is None:
         return None
@@ -351,32 +378,20 @@ def editor_inflacion(lugar: str = "curva"):
     else:
         defecto = float(rem.iloc[-1])
     defecto_largo = anual.get(hasta.year + 1, (1 + defecto) ** 12 - 1)
-    guardados = st.session_state.setdefault("infl_manual_vals", {})
     with st.expander(f"Inflación esperada para el CER: REM hasta {ultimo.strftime('%b-%y')} + tus supuestos"):
-        c1, c2 = st.columns([1, 2])
-        c1.markdown("**REM, IPC nivel general** (mediana, % mensual)")
-        c1.dataframe(pd.DataFrame({"Mes": [m.strftime("%b-%y") for m in rem.index],
-                                   "Inflación": rem.values}).style.format({"Inflación": "{:.2%}"}),
-                     hide_index=True, use_container_width=True)
-        base_man = pd.DataFrame({"Mes": [m.strftime("%b-%y") for m in meses_man],
-                                 "Inflación (% mensual)": [guardados.get(str(m), round(defecto * 100, 3))
-                                                           for m in meses_man]})
-        ed = c2.data_editor(base_man, key=f"infl_manual_{lugar}_{ultimo}", hide_index=True,
-                            disabled=["Mes"], use_container_width=True,
-                            column_config={"Inflación (% mensual)": st.column_config.NumberColumn(
-                                min_value=-5.0, max_value=50.0, step=0.05, format="%.3f")})
-        largo = c2.number_input(f"Inflación de {hasta.year + 1} en adelante (% anual)", min_value=-10.0,
+        vals = _editor_rem("infl_manual", lugar, rem, meses_man, defecto, "Inflación (% mensual)",
+                           "%.3f", 0.05, -5.0, 50.0, otras_claves=("infl_largo_val",))
+        n = st.session_state.get("infl_manual_reset", 0)
+        largo = st.number_input(f"Inflación de {hasta.year + 1} en adelante (% anual)", min_value=-10.0,
                                 max_value=500.0, step=0.5, format="%.2f",
-                                value=float(guardados.get("largo", round(defecto_largo * 100, 2))),
-                                key=f"infl_largo_{lugar}")
+                                value=float(st.session_state.get("infl_largo_val", round(defecto_largo * 100, 2))),
+                                key=f"infl_largo_{lugar}_{n}")
+        st.session_state["infl_largo_val"] = largo
         anual_txt = ", ".join(f"{k}: {v:.1%}" for k, v in sorted(anual.items()))
-        c2.caption(f"Por defecto, los meses de {hasta.year} cierran el año en la inflación anual del REM "
-                   f"({anual_txt}), y {hasta.year + 1} en adelante usa la del REM para {hasta.year + 1}.")
-    vals = {str(m): v for m, v in zip(meses_man, ed["Inflación (% mensual)"]) if pd.notna(v)}
-    vals["largo"] = largo
-    st.session_state["infl_manual_vals"] = vals
-    manual = {m: (v / 100 if pd.notna(v) else None) for m, v in zip(meses_man, ed["Inflación (% mensual)"])}
-    return fw.curva_inflacion(rem, manual, largo / 100)
+        st.caption(f"Por defecto, los meses de {hasta.year} después de {ultimo.strftime('%b-%y')} cierran el año "
+                   f"en la inflación anual del REM ({anual_txt}); {hasta.year + 1} en adelante usa la del REM "
+                   f"para {hasta.year + 1}.")
+    return fw.curva_inflacion(rem.iloc[:0], {m: v / 100 for m, v in vals.items()}, largo / 100)
 
 
 def vista_tabla_letam(proy_hoy: float, en_margen: bool, base_ltm: pd.DataFrame, curva_rem=None):
@@ -743,6 +758,11 @@ def vista_curvas():
         fecha_c = fecha_anterior(fecha - timedelta(days=dias))
 
     p = puntos_curva(curva, fecha, sel_hd, eje, con_duales, curva_rem, curva_infl, familias)
+    anios_disp = sorted({v.year for v in p.vencimiento}) if len(p) else []
+    sacar_anios = st.multiselect("Sacar vencimientos de (del ajuste, del gráfico y de la tabla)",
+                                 anios_disp, key=f"curva_anios_{curva}")
+    if sacar_anios:
+        p = p[~p.vencimiento.map(lambda v: v.year).isin(sacar_anios)].reset_index(drop=True)
     if len(p) < 2:
         st.info("No hay suficientes bonos con precio para armar la curva en esa fecha.")
         return
@@ -766,6 +786,8 @@ def vista_curvas():
     pc, fn_c = None, None
     if fecha_c is not None:
         pc = puntos_curva(curva, fecha_c, sel_hd, eje, con_duales, curva_rem, curva_infl, familias)
+        if sacar_anios:
+            pc = pc[~pc.vencimiento.map(lambda v: v.year).isin(sacar_anios)]
         pc = pc[~pc.ticker.isin(excluir)]
         if len(pc) >= 2:
             usar_c = (~pc.ticker.isin(set(letam.ticker) | set(lecer.ticker)) if solo_fija
